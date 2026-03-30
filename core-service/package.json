@@ -15,7 +15,7 @@
 		"clean": "rm -rf dist",
 		"build": "tsgo -p tsconfig.build.json",
 		"dev": "tsgo -p tsconfig.build.json --watch --preserveWatchOutput",
-		"dev:http": "npm run build && node dist/main.js --http ../workspace",
+		"dev:http": "node ./dev.mjs",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {
