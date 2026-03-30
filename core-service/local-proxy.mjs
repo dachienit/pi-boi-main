@@ -1,3 +1,6 @@
+import { createServer } from 'http';
+import { request } from 'https';
+
 const PARENT_PROXY = process.env.HTTPS_PROXY || process.env.http_proxy || 'http://127.0.0.1:3128';
 const LISTEN_PORT = process.env.PROXY_PORT || 8888;
 
