@@ -2,6 +2,43 @@
 
 import "dotenv/config";
 
+// Setup global proxy for LLM calls (must be before any fetch)
+import { setGlobalDispatcher, ProxyAgent } from "undici";
+
+if (process.env.PROX) {
+	const proxyUri = new URL(process.env.PROX).toString();
+	const token = process.env.AGENT_USER
+		? `Basic ${Buffer.from(`${process.env.AGENT_USER}:${process.env.AGENT_PWD || ""}`).toString("base64")}`
+		: undefined;
+	const dispatcher = new ProxyAgent({ uri: proxyUri, token });
+	setGlobalDispatcher(dispatcher);
+	console.log(`✓ Proxy: ${process.env.PROX} (user: ${process.env.AGENT_USER || "none"})`);
+}
+
+// Add api-version query param for Azure OpenAI endpoints (required by Bosch GenAI Platform)
+if (process.env.LLM_API_VERSION) {
+	const originalFetch = globalThis.fetch;
+	const apiVersion = process.env.LLM_API_VERSION;
+	const baseUrl = process.env.LLM_BASE_URL || "";
+
+	globalThis.fetch = (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+		let url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+
+		// Only modify requests to our configured LLM endpoint
+		if (baseUrl && url.startsWith(baseUrl.split("?")[0])) {
+			const urlObj = new URL(url);
+			if (!urlObj.searchParams.has("api-version")) {
+				urlObj.searchParams.set("api-version", apiVersion);
+				url = urlObj.toString();
+			}
+			input = typeof input === "string" ? url : new URL(url);
+		}
+
+		return originalFetch(input, init);
+	};
+	console.log(`✓ LLM API version: ${apiVersion}`);
+}
+
 import { join, resolve } from "path";
 import { type AgentRunner, getOrCreateRunner } from "./agent.js";
 import { downloadChannel } from "./download.js";

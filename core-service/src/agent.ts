@@ -28,12 +28,38 @@ import { createMomTools, setUploadFunction } from "./tools/index.js";
 //   LLM_MODEL     — model id     (default: "gpt-4o-mini")
 //   LLM_BASE_URL  — custom API base URL (e.g. http://localhost:11434/v1 for Ollama)
 //   LLM_API_KEY   — API key (alternative to ~/.pi/mom/auth.json)
+//   LLM_AUTH_HEADER — custom auth header name (e.g. "genaiplatform-farm-subscription-key" for Bosch)
+//   LLM_BASE_MODEL — base model to clone settings from (for custom endpoints, default: "llama3-70b-8192")
 const llmProvider = process.env.LLM_PROVIDER || "openai";
 const llmModelId = process.env.LLM_MODEL || "gpt-4o-mini";
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const model = (getModel as (p: string, m: string) => ReturnType<typeof getModel>)(llmProvider, llmModelId);
-if (process.env.LLM_BASE_URL) {
+let model: ReturnType<typeof getModel>;
+
+// If custom endpoint is configured, use a base model template and override
+if (process.env.LLM_BASE_URL && process.env.LLM_AUTH_HEADER) {
+	// Use groq's llama3-70b-8192 as template (uses openai-completions API)
+	const baseModelId = process.env.LLM_BASE_MODEL || "llama3-70b-8192";
+	model = (getModel as (p: string, m: string) => ReturnType<typeof getModel>)("groq", baseModelId);
+
+	// Override with custom endpoint settings
+	model.id = llmModelId;
 	model.baseUrl = process.env.LLM_BASE_URL;
+	(model as any).provider = llmProvider;
+	(model as any).headers = {
+		...(model as any).headers,
+		[process.env.LLM_AUTH_HEADER]: process.env.LLM_API_KEY,
+	};
+
+	console.log(`✓ LLM: ${llmModelId} @ ${process.env.LLM_BASE_URL}`);
+	console.log(`✓ LLM custom header: ${process.env.LLM_AUTH_HEADER}`);
+} else {
+	// Standard provider/model lookup
+	model = (getModel as (p: string, m: string) => ReturnType<typeof getModel>)(llmProvider, llmModelId);
+
+	if (process.env.LLM_BASE_URL) {
+		model.baseUrl = process.env.LLM_BASE_URL;
+	}
 }
 
 if (process.env.LLM_API_TYPE) {
