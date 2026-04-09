@@ -4,8 +4,7 @@ import "dotenv/config";
 
 // Setup global proxy for LLM calls (must be before any fetch)
 import { setGlobalDispatcher, ProxyAgent } from "undici";
-
-if (process.env.PROX) {
+ if (process.env.PROX) {
 	const proxyUri = new URL(process.env.PROX).toString();
 	const token = process.env.AGENT_USER
 		? `Basic ${Buffer.from(`${process.env.AGENT_USER}:${process.env.AGENT_PWD || ""}`).toString("base64")}`
