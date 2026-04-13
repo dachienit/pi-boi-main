@@ -1,57 +1,53 @@
-# Octo Project - Architecture Documentation
+# Octo Project - Tài liệu Kiến trúc
 
-## Overview
+## Tổng quan
 
-- **Project**: pi-boi-main (tên gọi: Octo)
-- **Identity**: AI Agent expert về SAP ABAP S4Hana, SAP ABAP on cloud, SAP ABAP refactor code (from ABAP R3 ECC to ABAP S4Hana new syntax 7.5+)
-- **Platform**: SAP BTP
+- **Dự án**: pi-boi-main (tên gọi: Octo)
+- **Định vị**: AI Agent chuyên về SAP ABAP S4Hana, SAP ABAP on cloud, refactor ABAP (từ ABAP R3 ECC sang cú pháp ABAP S4Hana mới 7.5+)
+- **Nền tảng**: SAP BTP
 
 ---
 
-## AI Models
+## Mô hình AI
 
+| Model                                 | Chi phí | Mục đích sử dụng                                                   |
+| ------------------------------------- | ------- | ------------------------------------------------------------------ |
+| **LLM Farm** (gpt-5-nano)             | FREE    | Router, MCP                                                        |
+| **DIA Brain** (Claude Opus 4.6 + RAG) | PAID    | Assistant, Analysis, Refactor, Review, FixIssue, GenerateABAPCode |
 
-| Model                                 | Cost | Use Case                                                          |
-| ------------------------------------- | ---- | ----------------------------------------------------------------- |
-| **LLM Farm** (gpt-5-nano)             | FREE | Router, MCP                                                       |
-| **DIA Brain** (Claude Opus 4.6 + RAG) | PAID | Assistant, Analysis, Refactor, Review, FixIssue, GenerateABAPCode |
-
-
-### Token Optimization (DIA Brain)
+### Tối ưu Token (DIA Brain)
 
 - Chỉ gửi context cần thiết (transform & trim)
-- Chỉ load skills liên quan
+- Chỉ load skill liên quan
 
 ---
 
 ## Skills
 
+| Skill                | Model     | Mô tả                                                          |
+| -------------------- | --------- | -------------------------------------------------------------- |
+| **Assistant**        | DIA Brain | AI Assistant giải đáp tất cả câu hỏi liên quan SAP ABAP       |
+| **MCP**              | LLM Farm  | Gọi hệ thống SAP on-prem từ BTP qua MCP server                |
+| **Analysis**         | DIA Brain | Phân tích SAP ABAP objects                                     |
+| **Refactor**         | DIA Brain | Refactor R3 -> S4 ABAP (syntax 7.5, CleanCode)                |
+| **Review**           | DIA Brain | Review ABAP code, đề xuất cải tiến                             |
+| **FixIssue**         | DIA Brain | Fix ABAP bugs dựa vào issue logs từ ATC check                  |
+| **GenerateABAPCode** | DIA Brain | Tạo ABAP code tự động từ ngôn ngữ tự nhiên                     |
 
-| Skill                | Model     | Description                                                     |
-| -------------------- | --------- | --------------------------------------------------------------- |
-| **Assistant**        | DIA Brain | AI Assistant giải đáp tất cả các câu hỏi liên quan đến SAP ABAP |
-| **MCP**              | LLM Farm  | Gọi SAP on-prem systems từ BTP qua MCP server                   |
-| **Analysis**         | DIA Brain | Phân tích SAP ABAP objects                                      |
-| **Refactor**         | DIA Brain | Refactor R3 → S4 ABAP (syntax 7.5, CleanCode)                   |
-| **Review**           | DIA Brain | Review ABAP code, đề xuất cải tiến                              |
-| **FixIssue**         | DIA Brain | Fix ABAP bugs dựa váo issue logs từ ATC check                   |
-| **GenerateABAPCode** | DIA Brain | Tạo code ABAP tự động từ ngôn ngữ tự nhiên                      |
+### Định nghĩa Skill
 
-
-### Skill Definition
-
-- Mỗi skill là file `SKILL.md` riêng với instructions
-- Path: `core-service/skills/<skill-name>/SKILL.md`
+- Mỗi skill là một file `SKILL.md` riêng với instructions
+- Đường dẫn: `core-service/skills/<skill-name>/SKILL.md`
 
 ### Tools
 
-- mcp.ts, assistant.ts, analysis.ts, refactor.ts, review.ts, fixIssue.ts, generaterABAPCode.ts
-- Mỗi tool `*.ts` code typescript dùng để thực thi skill tương ứng
-- Path: `core-service/src/tools/<tool-name>.ts`
+- `mcp.ts`, `assistant.ts`, `analysis.ts`, `refactor.ts`, `review.ts`, `fixIssue.ts`, `generaterABAPCode.ts`
+- Mỗi tool `*.ts` là mã TypeScript dùng để thực thi skill tương ứng
+- Đường dẫn: `core-service/src/tools/<tool-name>.ts`
 
 ---
 
-## Architecture Flow
+## Luồng Kiến trúc
 
 ```mermaid
 flowchart TD
@@ -73,10 +69,7 @@ flowchart TD
     C7 --> D
 ```
 
-
-
-### Router Output Mapping (Easy Read)
-
+### Mapping đầu ra Router (Dễ đọc)
 
 | Router chọn skill | Tool/Module          | Kết quả chính                   |
 | ----------------- | -------------------- | ------------------------------- |
@@ -86,43 +79,38 @@ flowchart TD
 | Refactor          | refactor.ts          | Refactor R3 -> S4 (7.5+)        |
 | Review            | review.ts            | Review code và đề xuất cải tiến |
 | FixIssue          | fixIssue.ts          | Sửa lỗi theo ATC logs           |
-| GenerateABAPCode | generaterABAPCode.ts | Sinh ABAP code từ prompt        |
+| GenerateABAPCode  | generaterABAPCode.ts | Sinh ABAP code từ prompt        |
 
+## Nhiệm vụ Triển khai
 
-## Implementation Tasks
-
-
-| #   | Task                                    | Priority | Status |
-| --- | --------------------------------------- | -------- | ------ |
-| 1   | Router module (classify, select skills) | High     | Open   |
-| 2   | AI Assistant                            | High     | Open   |
-| 3   | MCP                                     | High     | Open   |
-| 4   | Analysis                                | High     | Open   |
-| 5   | Refactor                                | High     | Open   |
-| 6   | Review                                  | High     | Open   |
-| 7   | FixIssue                                | High     | Open   |
-| 8   | GenerateABAPCode                        | High     | Open   |
-
+| #   | Task                                    | Ưu tiên | Trạng thái |
+| --- | --------------------------------------- | ------- | ---------- |
+| 1   | Router module (classify, select skills) | Cao     | Open       |
+| 2   | AI Assistant                            | Cao     | Open       |
+| 3   | MCP                                     | Cao     | Open       |
+| 4   | Analysis                                | Cao     | Open       |
+| 5   | Refactor                                | Cao     | Open       |
+| 6   | Review                                  | Cao     | Open       |
+| 7   | FixIssue                                | Cao     | Open       |
+| 8   | GenerateABAPCode                        | Cao     | Open       |
 
 ---
 
-## Technical Decisions
+## Quyết định Kỹ thuật
 
-
-| Decision        | Choice                             | Reason                     |
+| Quyết định      | Lựa chọn                           | Lý do                      |
 | --------------- | ---------------------------------- | -------------------------- |
-| Router logic    | LLM prompt + few-shot              | Flexible, easy to update   |
-| Fallback model  | DIA Brain                          | Safer for unknown requests |
-| Hybrid requests | Sequential (parallel for MCP only) | Avoid race conditions      |
-| Context sharing | Transform format between models    | Different APIs             |
-| Error handling  | Report to user                     | User decides next step     |
-
+| Router logic    | LLM prompt + few-shot              | Linh hoạt, dễ cập nhật     |
+| Fallback model  | DIA Brain                          | An toàn hơn cho yêu cầu lạ |
+| Hybrid requests | Sequential (parallel cho MCP)      | Tránh race condition       |
+| Context sharing | Transform format giữa các model    | API khác nhau              |
+| Error handling  | Report cho user                    | User quyết định bước tiếp  |
 
 ---
 
-## Configuration
+## Cấu hình
 
-### Environment Variables
+### Biến môi trường
 
 ```
 # LLM Farm
@@ -131,7 +119,7 @@ LLM_FARM_MODEL=gpt-5-nano
 LLM_FARM_BASE_URL=...
 LLM_FARM_API_KEY=...
 
-# DIA Brain  
+# DIA Brain
 DIA_BRAIN_PROVIDER=...
 DIA_BRAIN_MODEL=gemini-2.5-pro
 DIA_BRAIN_BASE_URL=...
@@ -140,7 +128,7 @@ DIA_BRAIN_API_KEY=...
 
 ---
 
-## File Structure
+## Cấu trúc File
 
 ```text
 pi-boi-main/
@@ -195,4 +183,3 @@ web-ui/
 ├─ CHANGELOG.md          # Lịch sử thay đổi phiên bản
 └─ README.md             # Hướng dẫn sử dụng frontend
 ```
-
