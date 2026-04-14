@@ -12,7 +12,7 @@ setTranslations(translations);
 
 // Read config from URL params
 const urlParams = new URLSearchParams(window.location.search);
-const baseUrl = urlParams.get("baseUrl") || "http://localhost:3030";
+const baseUrl = urlParams.get("baseUrl") || "";
 const userName = urlParams.get("userName") || "user";
 
 // Stable channel ID per browser session
