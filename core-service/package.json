@@ -4,7 +4,7 @@
 	"description": "boi agent",
 	"type": "module",
 	"bin": {
-		"octo": "dist/main.js"
+		"octo": "dist/bootstrap.js"
 	},
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
@@ -15,7 +15,7 @@
 		"clean": "rm -rf dist",
 		"build": "tsgo -p tsconfig.build.json",
 		"dev": "tsgo -p tsconfig.build.json --watch --preserveWatchOutput",
-		"dev:http": "node dist/main.js --http workspacerks",
+		"dev:http": "node dist/bootstrap.js --http workspacerks",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {

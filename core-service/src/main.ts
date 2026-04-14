@@ -2,28 +2,8 @@
 
 import "dotenv/config";
 
-// ── DEBUG: dump proxy-related env vars ──
-console.log("[DEBUG] === Proxy env vars at startup ===");
-console.log("[DEBUG] PROX =", process.env.PROX ?? "(unset)");
-console.log("[DEBUG] HTTP_PROXY =", process.env.HTTP_PROXY ?? "(unset)");
-console.log("[DEBUG] HTTPS_PROXY =", process.env.HTTPS_PROXY ?? "(unset)");
-console.log("[DEBUG] http_proxy =", process.env.http_proxy ?? "(unset)");
-console.log("[DEBUG] https_proxy =", process.env.https_proxy ?? "(unset)");
-console.log("[DEBUG] no_proxy =", process.env.no_proxy ?? "(unset)");
-console.log("[DEBUG] NO_PROXY =", process.env.NO_PROXY ?? "(unset)");
-
-// Clear standard proxy env vars when PROX is not set (e.g. SAP BAS/BTP),
-// so pi-ai's EnvHttpProxyAgent doesn't pick up system-level proxy settings.
-if (!process.env.PROX) {
-	delete process.env.HTTP_PROXY;
-	delete process.env.HTTPS_PROXY;
-	delete process.env.http_proxy;
-	delete process.env.https_proxy;
-	console.log("[DEBUG] Cleared all standard proxy env vars (PROX not set)");
-}
-
 // Setup global proxy for LLM calls (must be before any fetch)
-import { setGlobalDispatcher, ProxyAgent, Agent as UndiciAgent } from "undici";
+import { setGlobalDispatcher, ProxyAgent } from "undici";
 if (process.env.PROX) {
 	const proxyUri = new URL(process.env.PROX).toString();
 	const token = process.env.AGENT_USER
@@ -32,10 +12,6 @@ if (process.env.PROX) {
 	const dispatcher = new ProxyAgent({ uri: proxyUri, token });
 	setGlobalDispatcher(dispatcher);
 	console.log(`✓ Proxy: ${process.env.PROX} (user: ${process.env.AGENT_USER || "none"})`);
-} else {
-	// Force a clean dispatcher with no proxy
-	setGlobalDispatcher(new UndiciAgent());
-	console.log("[DEBUG] Set clean UndiciAgent dispatcher (no proxy)");
 }
 
 // Add api-version query param for Azure OpenAI endpoints (required by Bosch GenAI Platform)
@@ -57,45 +33,10 @@ if (process.env.LLM_API_VERSION) {
 			input = typeof input === "string" ? url : new URL(url);
 		}
 
-		console.log(`[DEBUG] fetch → ${typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url}`);
-		return originalFetch(input, init).catch((err: unknown) => {
-			console.error(`[DEBUG] fetch FAILED:`, err);
-			throw err;
-		});
+		return originalFetch(input, init);
 	};
 	console.log(`✓ LLM API version: ${apiVersion}`);
 }
-
-// ── DEBUG: test LLM connectivity at startup ──
-setTimeout(async () => {
-	console.log("[DEBUG] === Testing LLM connectivity ===");
-	const testUrl = process.env.LLM_BASE_URL;
-	if (!testUrl) {
-		console.log("[DEBUG] LLM_BASE_URL not set, skipping test");
-		return;
-	}
-	try {
-		const resp = await fetch(testUrl + "/chat/completions?api-version=" + (process.env.LLM_API_VERSION || ""), {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				...(process.env.LLM_AUTH_HEADER && process.env.LLM_API_KEY
-					? { [process.env.LLM_AUTH_HEADER]: process.env.LLM_API_KEY }
-					: {}),
-			},
-			body: JSON.stringify({
-				model: process.env.LLM_MODEL || "gpt-5-nano-2025-08-07",
-				messages: [{ role: "user", content: "hi" }],
-				max_tokens: 5,
-			}),
-		});
-		const text = await resp.text();
-		console.log(`[DEBUG] Test fetch status: ${resp.status}`);
-		console.log(`[DEBUG] Test fetch response: ${text.substring(0, 300)}`);
-	} catch (err: unknown) {
-		console.error(`[DEBUG] Test fetch FAILED:`, err);
-	}
-}, 2000);
 
 import { join, resolve } from "path";
 import { type AgentRunner, getOrCreateRunner } from "./agent.js";
