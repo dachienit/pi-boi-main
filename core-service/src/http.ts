@@ -1,8 +1,40 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "fs";
-import { isAbsolute, join, normalize } from "path";
+import { basename, isAbsolute, join, normalize } from "path";
 import express from "express";
 import * as log from "./log.js";
 import type { BotContext, BotHandler } from "./types.js";
+
+/**
+ * Normalize a file path for the current OS.
+ * - If path is an absolute Windows path (C:\...) on Linux, extract the relative part and resolve against workingDir
+ * - If path is relative, resolve against workingDir
+ * - Otherwise return normalized absolute path
+ */
+function normalizeFilePath(filePath: string, workingDir: string): string {
+	// Check for Windows absolute path (e.g., C:\Users\... or D:\...)
+	const windowsDrivePattern = /^[A-Za-z]:[\\\/]/;
+	if (windowsDrivePattern.test(filePath)) {
+		// On Linux, try to extract a meaningful relative path from Windows path
+		// Look for known markers like "artifacts", "sessions", "workspacerks"
+		const normalizedWinPath = filePath.replace(/\\/g, "/");
+		const markers = ["workspacerks/", "artifacts/", "sessions/"];
+		for (const marker of markers) {
+			const idx = normalizedWinPath.indexOf(marker);
+			if (idx !== -1) {
+				const relativePart = normalizedWinPath.slice(idx);
+				return join(workingDir, "..", relativePart);
+			}
+		}
+		// Fallback: just use the filename
+		return join(workingDir, basename(filePath));
+	}
+
+	// Regular path handling
+	if (isAbsolute(filePath)) {
+		return normalize(filePath);
+	}
+	return join(workingDir, filePath);
+}
 
 // ============================================================================
 // HTTP context adapter
@@ -237,7 +269,8 @@ export class HttpServer {
 
 	private handleArtifactUrl(filePath: string, res: express.Response): void {
 		const artifactsDir = normalize(join(this.workingDir, "artifacts"));
-		const normalizedFilePath = normalize(filePath);
+		// Use normalizeFilePath to handle cross-platform paths
+		const normalizedFilePath = normalizeFilePath(filePath, this.workingDir);
 
 		if (!filePath || !normalizedFilePath.startsWith(artifactsDir)) {
 			res.json({ url: null });
@@ -267,8 +300,8 @@ export class HttpServer {
 			return;
 		}
 
-		// Use isAbsolute() for cross-platform support (Windows: C:\..., Linux: /...)
-		const resolved = normalize(isAbsolute(filePath) ? filePath : join(this.workingDir, filePath));
+		// Use normalizeFilePath for cross-platform support (handles Windows paths on Linux)
+		const resolved = normalizeFilePath(filePath, this.workingDir);
 		const normalizedWorkingDir = normalize(this.workingDir);
 
 		log.logInfo(`[/file] path=${filePath}, resolved=${resolved}, workingDir=${normalizedWorkingDir}`);
@@ -382,7 +415,9 @@ export class HttpServer {
 						}
 						threadParts.push(block);
 						if (tc.name === "attach" && tc.args.path) {
-							files.push({ path: tc.args.path as string, title: tc.args.title as string | undefined });
+							// Normalize path to handle cross-platform session access (Windows path on Linux, etc.)
+							const normalizedPath = normalizeFilePath(tc.args.path as string, this.workingDir);
+							files.push({ path: normalizedPath, title: tc.args.title as string | undefined });
 						}
 					}
 
