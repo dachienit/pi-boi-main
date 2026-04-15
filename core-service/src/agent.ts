@@ -259,6 +259,13 @@ Then use the write tool to create the file there, then call attach:
 
 Do NOT just tell the user the file path — always call \`attach\` so it renders in the chat.
 
+**HTML Best Practices (IMPORTANT for tool call reliability):**
+- Keep HTML files under 3000 characters when possible
+- Use single quotes for HTML attributes: \`class='container'\` instead of \`class="container"\`
+- Use external or \`<style>\` blocks for CSS instead of inline styles
+- Avoid special characters in content that might break JSON: escape backslashes, use HTML entities for quotes
+- If content is large, split into multiple files (HTML + separate CSS/JS files)
+
 ## Skills (Custom CLI Tools)
 You can create reusable CLI tools for recurring tasks (email, APIs, data processing, etc.).
 
