@@ -1,25 +1,79 @@
 import tailwindcss from "@tailwindcss/vite";
-import { defineConfig } from "vite";
-import { nodePolyfills } from "vite-plugin-node-polyfills";
+import { defineConfig, type Plugin } from "vite";
+
+function stubNodeModules(): Plugin {
+	const nodeModules = [
+		"stream",
+		"http",
+		"https",
+		"crypto",
+		"os",
+		"path",
+		"fs",
+		"net",
+		"tls",
+		"zlib",
+		"events",
+		"buffer",
+		"util",
+		"url",
+		"querystring",
+		"child_process",
+		"worker_threads",
+		"assert",
+		"dns",
+		"http2",
+		"tty",
+		"dgram",
+		"readline",
+	];
+
+	const stubCode = `
+		export default {};
+		export const Readable = class {};
+		export const Writable = class {};
+		export const Stream = class {};
+		export const Agent = class {};
+		export const request = () => {};
+		export const get = () => {};
+		export const createServer = () => {};
+		export const Server = class {};
+		export const connect = () => {};
+	`;
+
+	return {
+		name: "stub-node-modules",
+		enforce: "pre",
+		resolveId(id) {
+			if (nodeModules.includes(id) || id.startsWith("node:")) {
+				return `\0stub:${id}`;
+			}
+			if (id.includes("@smithy/node-http-handler") || 
+				id.includes("@aws-sdk/credential-provider")) {
+				return `\0stub:${id}`;
+			}
+			return null;
+		},
+		load(id) {
+			if (id.startsWith("\0stub:")) {
+				return stubCode;
+			}
+			return null;
+		},
+	};
+}
 
 export default defineConfig({
-	plugins: [
-		tailwindcss(),
-		nodePolyfills({
-			include: ["stream", "buffer", "crypto", "http", "https", "os", "path", "process", "util"],
-			globals: {
-				Buffer: true,
-				global: true,
-				process: true,
-			},
-		}),
-	],
+	plugins: [stubNodeModules(), tailwindcss()],
 	resolve: {
 		dedupe: ["@mariozechner/mini-lit", "lit"],
 	},
 	build: {
-		commonjsOptions: {
-			transformMixedEsModules: true,
+		rollupOptions: {
+			onwarn(warning, warn) {
+				if (warning.code === "MODULE_LEVEL_DIRECTIVE") return;
+				warn(warning);
+			},
 		},
 	},
 	server: {
