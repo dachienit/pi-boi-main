@@ -1,10 +1,26 @@
 import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "vite";
+import { nodePolyfills } from "vite-plugin-node-polyfills";
 
 export default defineConfig({
-	plugins: [tailwindcss()],
+	plugins: [
+		tailwindcss(),
+		nodePolyfills({
+			include: ["stream", "buffer", "crypto", "http", "https", "os", "path", "process", "util"],
+			globals: {
+				Buffer: true,
+				global: true,
+				process: true,
+			},
+		}),
+	],
 	resolve: {
 		dedupe: ["@mariozechner/mini-lit", "lit"],
+	},
+	build: {
+		commonjsOptions: {
+			transformMixedEsModules: true,
+		},
 	},
 	server: {
 		proxy: {

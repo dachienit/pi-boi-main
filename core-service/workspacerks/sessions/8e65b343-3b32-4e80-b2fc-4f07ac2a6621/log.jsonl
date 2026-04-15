@@ -1,3 +1,0 @@
-{"date":"2026-04-14T10:24:59.407Z","ts":"1776162299.401000","user":"web-user","userName":"user","text":"hello","attachments":[],"isBot":false}
-{"date":"2026-04-14T10:25:19.480Z","ts":"1776162319.480000","user":"bot","text":"_Sorry, something went wrong_","attachments":[],"isBot":true,"isFinal":true}
-{"date":"2026-04-14T10:25:19.482Z","ts":"1776162319.482000","user":"bot","text":"_Error: Connection error._","attachments":[],"isBot":true,"isThread":true}
