@@ -95,7 +95,12 @@ const editSchema = Type.Object({
 	newText: Type.String({ description: "New text to replace the old text with" }),
 });
 
-export function createEditTool(_executor: Executor): AgentTool<typeof editSchema> {
+/**
+ * Create edit tool with working directory context.
+ * @param _executor - Executor (unused, kept for API compatibility)
+ * @param workingDir - Absolute path to the working directory (for resolving relative paths)
+ */
+export function createEditTool(_executor: Executor, workingDir: string): AgentTool<typeof editSchema> {
 	return {
 		name: "edit",
 		label: "edit",
@@ -108,7 +113,8 @@ export function createEditTool(_executor: Executor): AgentTool<typeof editSchema
 			_signal?: AbortSignal,
 		) => {
 			// Use Node.js fs APIs for cross-platform compatibility (Windows + Linux)
-			const resolvedPath = isAbsolute(filePath) ? filePath : resolve(process.cwd(), filePath);
+			// Resolve relative paths against workingDir, not process.cwd()
+			const resolvedPath = isAbsolute(filePath) ? filePath : resolve(workingDir, filePath);
 
 			try {
 				// Read the file

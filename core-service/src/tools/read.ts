@@ -36,7 +36,12 @@ interface ReadToolDetails {
 	truncation?: TruncationResult;
 }
 
-export function createReadTool(_executor: Executor): AgentTool<typeof readSchema> {
+/**
+ * Create read tool with working directory context.
+ * @param _executor - Executor (unused, kept for API compatibility)
+ * @param workingDir - Absolute path to the working directory (for resolving relative paths)
+ */
+export function createReadTool(_executor: Executor, workingDir: string): AgentTool<typeof readSchema> {
 	return {
 		name: "read",
 		label: "read",
@@ -48,7 +53,8 @@ export function createReadTool(_executor: Executor): AgentTool<typeof readSchema
 			_signal?: AbortSignal,
 		): Promise<{ content: (TextContent | ImageContent)[]; details: ReadToolDetails | undefined }> => {
 			// Use Node.js fs APIs for cross-platform compatibility (Windows + Linux)
-			const resolvedPath = isAbsolute(filePath) ? filePath : resolve(process.cwd(), filePath);
+			// Resolve relative paths against workingDir, not process.cwd()
+			const resolvedPath = isAbsolute(filePath) ? filePath : resolve(workingDir, filePath);
 
 			const mimeType = isImageFile(filePath);
 

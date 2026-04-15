@@ -1,5 +1,5 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "fs";
-import { join } from "path";
+import { isAbsolute, join, normalize } from "path";
 import express from "express";
 import * as log from "./log.js";
 import type { BotContext, BotHandler } from "./types.js";
@@ -236,14 +236,16 @@ export class HttpServer {
 	}
 
 	private handleArtifactUrl(filePath: string, res: express.Response): void {
-		const artifactsDir = join(this.workingDir, "artifacts");
+		const artifactsDir = normalize(join(this.workingDir, "artifacts"));
+		const normalizedFilePath = normalize(filePath);
 
-		if (!filePath || !filePath.startsWith(artifactsDir)) {
+		if (!filePath || !normalizedFilePath.startsWith(artifactsDir)) {
 			res.json({ url: null });
 			return;
 		}
 
-		const relativePath = filePath.slice(artifactsDir.length).replace(/^[/\\]/, "");
+		// Get relative path and convert to forward slashes for URL
+		const relativePath = normalizedFilePath.slice(artifactsDir.length).replace(/^[/\\]/, "").replace(/\\/g, "/");
 		let url = `http://localhost:${this.port}/artifacts/${relativePath}`;
 
 		const tunnelUrlFile = "/tmp/artifacts-url.txt";
@@ -265,13 +267,20 @@ export class HttpServer {
 			return;
 		}
 
-		const resolved = filePath.startsWith("/") ? filePath : join(this.workingDir, filePath);
-		if (!resolved.startsWith(this.workingDir)) {
+		// Use isAbsolute() for cross-platform support (Windows: C:\..., Linux: /...)
+		const resolved = normalize(isAbsolute(filePath) ? filePath : join(this.workingDir, filePath));
+		const normalizedWorkingDir = normalize(this.workingDir);
+
+		log.logInfo(`[/file] path=${filePath}, resolved=${resolved}, workingDir=${normalizedWorkingDir}`);
+
+		if (!resolved.startsWith(normalizedWorkingDir)) {
+			log.logWarning(`[/file] Forbidden: resolved path not in workingDir`);
 			res.status(403).json({ error: "Forbidden" });
 			return;
 		}
 
 		if (!existsSync(resolved)) {
+			log.logWarning(`[/file] Not found: ${resolved}`);
 			res.status(404).json({ error: "Not found" });
 			return;
 		}

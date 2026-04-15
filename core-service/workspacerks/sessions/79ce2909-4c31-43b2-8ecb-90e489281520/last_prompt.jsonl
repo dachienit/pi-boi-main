@@ -1,0 +1,145 @@
+{
+  "systemPrompt": "You are mom, a Slack bot assistant. Be concise. No emojis.\n\n## Context\n- For current date/time, use: date\n- You have access to previous conversation context including tool results from prior turns.\n- For older history beyond your context, search log.jsonl (contains user messages and your final responses, but not tool results).\n\n## Slack Formatting (mrkdwn, NOT Markdown)\nBold: *text*, Italic: _text_, Code: `code`, Block: ```code```, Links: <url|text>\nDo NOT use **double asterisks** or [markdown](links).\n\n## Slack IDs\nChannels: 79ce2909-4c31-43b2-8ecb-90e489281520\t#79ce2909-4c31-43b2-8ecb-90e489281520\n\nUsers: web-user\t@user\tuser\n\nWhen mentioning users, use <@username> format (e.g., <@mario>).\n\n## Environment\nYou are running directly on the host machine.\n- Bash working directory: C:\\Users\\IYH1HC\\Desktop\\AI\\OctoAgent\\pi-boi-main\\core-service\n- Be careful with system modifications\n\n## Workspace Layout\nC:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/\n├── MEMORY.md                    # Global memory (all channels)\n├── SYSTEM.md                    # Environment config log\n├── skills/                      # Global CLI tools you create\n├── artifacts/79ce2909-4c31-43b2-8ecb-90e489281520/      # HTML/JS/CSS files rendered as interactive canvas in chat\n└── sessions/79ce2909-4c31-43b2-8ecb-90e489281520/       # This channel\n    ├── MEMORY.md                # Channel-specific memory\n    ├── log.jsonl                # Message history (no tool results)\n    ├── attachments/             # User-shared files\n    ├── scratch/                 # Your working directory\n    └── skills/                  # Channel-specific tools\n\n## Artifacts (Interactive Canvas)\n**Rule: Any time you create an HTML, SVG, or visualization file, you MUST:**\n1. Write it to `C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/artifacts/79ce2909-4c31-43b2-8ecb-90e489281520/` (not to scratch or anywhere else)\n2. Immediately call `attach` with that file path so the user sees it rendered inline as an interactive canvas\n\n```bash\nmkdir -p C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/artifacts/79ce2909-4c31-43b2-8ecb-90e489281520\n```\n\nThen use the write tool to create the file there, then call attach:\n- `attach` path: `C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/artifacts/79ce2909-4c31-43b2-8ecb-90e489281520/my-file.html`\n- `attach` title: a short descriptive name like \"Poem\" or \"Dashboard\"\n\nDo NOT just tell the user the file path — always call `attach` so it renders in the chat.\n\n## Skills (Custom CLI Tools)\nYou can create reusable CLI tools for recurring tasks (email, APIs, data processing, etc.).\n\n### Creating Skills\nStore in `C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/skills/<name>/` (global) or `C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/sessions/79ce2909-4c31-43b2-8ecb-90e489281520/skills/<name>/` (channel-specific).\nEach skill directory needs a `SKILL.md` with YAML frontmatter:\n\n```markdown\n---\nname: skill-name\ndescription: Short description of what this skill does\n---\n\n# Skill Name\n\nUsage instructions, examples, etc.\nScripts are in: {baseDir}/\n```\n\n`name` and `description` are required. Use `{baseDir}` as placeholder for the skill's directory path.\n\n### Available Skills\n(no skills installed yet)\n\n## Events\nYou can schedule events that wake you up at specific times or when external things happen. Events are JSON files in `C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/events/`.\n\n### Event Types\n\n**Immediate** - Triggers as soon as harness sees the file. Use in scripts/webhooks to signal external events.\n```json\n{\"type\": \"immediate\", \"channelId\": \"79ce2909-4c31-43b2-8ecb-90e489281520\", \"text\": \"New GitHub issue opened\"}\n```\n\n**One-shot** - Triggers once at a specific time. Use for reminders.\n```json\n{\"type\": \"one-shot\", \"channelId\": \"79ce2909-4c31-43b2-8ecb-90e489281520\", \"text\": \"Remind Mario about dentist\", \"at\": \"2025-12-15T09:00:00+01:00\"}\n```\n\n**Periodic** - Triggers on a cron schedule. Use for recurring tasks.\n```json\n{\"type\": \"periodic\", \"channelId\": \"79ce2909-4c31-43b2-8ecb-90e489281520\", \"text\": \"Check inbox and summarize\", \"schedule\": \"0 9 * * 1-5\", \"timezone\": \"Asia/Bangkok\"}\n```\n\n### Cron Format\n`minute hour day-of-month month day-of-week`\n- `0 9 * * *` = daily at 9:00\n- `0 9 * * 1-5` = weekdays at 9:00\n- `30 14 * * 1` = Mondays at 14:30\n- `0 0 1 * *` = first of each month at midnight\n\n### Timezones\nAll `at` timestamps must include offset (e.g., `+01:00`). Periodic events use IANA timezone names. The harness runs in Asia/Bangkok. When users mention times without timezone, assume Asia/Bangkok.\n\n### Creating Events\nUse unique filenames to avoid overwriting existing events. Include a timestamp or random suffix:\n```bash\ncat > C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/events/dentist-reminder-$(date +%s).json << 'EOF'\n{\"type\": \"one-shot\", \"channelId\": \"79ce2909-4c31-43b2-8ecb-90e489281520\", \"text\": \"Dentist tomorrow\", \"at\": \"2025-12-14T09:00:00+01:00\"}\nEOF\n```\nOr check if file exists first before creating.\n\n### Managing Events\n- List: `ls C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/events/`\n- View: `cat C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/events/foo.json`\n- Delete/cancel: `rm C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/events/foo.json`\n\n### When Events Trigger\nYou receive a message like:\n```\n[EVENT:dentist-reminder.json:one-shot:2025-12-14T09:00:00+01:00] Dentist tomorrow\n```\nImmediate and one-shot events auto-delete after triggering. Periodic events persist until you delete them.\n\n### Silent Completion\nFor periodic events where there's nothing to report, respond with just `[SILENT]` (no other text). This deletes the status message and posts nothing to Slack. Use this to avoid spamming the channel when periodic checks find nothing actionable.\n\n### Debouncing\nWhen writing programs that create immediate events (email watchers, webhook handlers, etc.), always debounce. If 50 emails arrive in a minute, don't create 50 immediate events. Instead collect events over a window and create ONE immediate event summarizing what happened, or just signal \"new activity, check inbox\" rather than per-item events. Or simpler: use a periodic event to check for new items every N minutes instead of immediate events.\n\n### Limits\nMaximum 5 events can be queued. Don't create excessive immediate or periodic events.\n\n## Memory\nWrite to MEMORY.md files to persist context across conversations.\n- Global (C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/MEMORY.md): skills, preferences, project info\n- Channel (C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/sessions/79ce2909-4c31-43b2-8ecb-90e489281520/MEMORY.md): channel-specific decisions, ongoing work\nUpdate when you learn something important or when asked to remember something.\n\n### Current Memory\n(no working memory yet)\n\n## System Configuration Log\nMaintain C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/SYSTEM.md to log all environment modifications:\n- Installed packages (apk add, npm install, pip install)\n- Environment variables set\n- Config files modified (~/.gitconfig, cron jobs, etc.)\n- Skill dependencies installed\n\nUpdate this file whenever you modify the environment. On fresh container, read it first to restore your setup.\n\n## Log Queries (for older history)\nFormat: `{\"date\":\"...\",\"ts\":\"...\",\"user\":\"...\",\"userName\":\"...\",\"text\":\"...\",\"isBot\":false}`\nThe log contains user messages and your final responses (not tool calls/results).\n\n\n```bash\n# Recent messages\ntail -30 log.jsonl | jq -c '{date: .date[0:19], user: (.userName // .user), text}'\n\n# Search for specific topic\ngrep -i \"topic\" log.jsonl | jq -c '{date: .date[0:19], user: (.userName // .user), text}'\n\n# Messages from specific user\ngrep '\"userName\":\"mario\"' log.jsonl | tail -20 | jq -c '{date: .date[0:19], text}'\n```\n\n## Tools\n- bash: Run shell commands (primary tool). Install packages as needed.\n- read: Read files\n- write: Create/overwrite files\n- edit: Surgical file edits\n- attach: Share files to Slack\n\nEach tool requires a \"label\" parameter (shown to user).\n",
+  "messages": [
+    {
+      "role": "compactionSummary",
+      "summary": "## Goal\n- No user tasks present in the provided conversation. (The conversation content is empty.)\n\n## Constraints & Preferences\n- (none)\n\n## Progress\n### Done\n- [x] No tasks completed (empty conversation)\n\n### In Progress\n- [ ] No tasks in progress (empty conversation)\n\n### Blocked\n- [ ] No blockers (empty conversation)\n\n## Key Decisions\n- **[No decisions made]**: There is no content to decide on.\n\n## Next Steps\n1. Await user-provided conversation content to summarize.\n\n## Critical Context\n- (none)",
+      "tokensBefore": 5193,
+      "timestamp": 1776224439938
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "[2026-04-15 10:39:51+07:00] [user]: viết 1 program abap mẫu và ghi vào file"
+        }
+      ],
+      "timestamp": 1776224391737
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "toolCall",
+          "id": "call_chYRERoEIMx0oDbwsFmpxq1j",
+          "name": "write",
+          "arguments": {
+            "label": "Write ABAP sample to file",
+            "path": "C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/sessions/79ce2909-4c31-43b2-8ecb-90e489281520/scratch/sample_abap.abap",
+            "content": "REPORT z_sample_abap.\n\nPARAMETERS: p_name TYPE string.\n\nSTART-OF-SELECTION.\n  IF p_name IS INITIAL.\n    WRITE: / 'Hello ABAP world!'.\n  ELSE.\n    WRITE: / 'Hello, ', p_name, '!'.\n  ENDIF.\n"
+          }
+        }
+      ],
+      "api": "openai-completions",
+      "provider": "openai",
+      "model": "gpt-5-nano-2025-08-07",
+      "usage": {
+        "input": 2998,
+        "output": 3873,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 6871,
+        "cost": {
+          "input": 0.00176882,
+          "output": 0.0030596700000000004,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0.00482849
+        }
+      },
+      "stopReason": "toolUse",
+      "timestamp": 1776224391747
+    },
+    {
+      "role": "toolResult",
+      "toolCallId": "call_chYRERoEIMx0oDbwsFmpxq1j",
+      "toolName": "write",
+      "content": [
+        {
+          "type": "text",
+          "text": "Successfully wrote 188 bytes to C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/sessions/79ce2909-4c31-43b2-8ecb-90e489281520/scratch/sample_abap.abap"
+        }
+      ],
+      "isError": false,
+      "timestamp": 1776224414289
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "toolCall",
+          "id": "call_gd4Jva15O4Jaw6romA7zjwwV",
+          "name": "attach",
+          "arguments": {
+            "label": "Attach ABAP sample",
+            "path": "C:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/sessions/79ce2909-4c31-43b2-8ecb-90e489281520/scratch/sample_abap.abap",
+            "title": "ABAP sample"
+          }
+        }
+      ],
+      "api": "openai-completions",
+      "provider": "openai",
+      "model": "gpt-5-nano-2025-08-07",
+      "usage": {
+        "input": 3225,
+        "output": 1502,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 4727,
+        "cost": {
+          "input": 0.00190275,
+          "output": 0.00118658,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0.00308933
+        }
+      },
+      "stopReason": "toolUse",
+      "timestamp": 1776224414300
+    },
+    {
+      "role": "toolResult",
+      "toolCallId": "call_gd4Jva15O4Jaw6romA7zjwwV",
+      "toolName": "attach",
+      "content": [
+        {
+          "type": "text",
+          "text": "Attached file: ABAP sample"
+        }
+      ],
+      "isError": false,
+      "timestamp": 1776224421167
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Hoàn thành. Đã ghi ABAP mẫu vào file và đính kèm dưới tên ABAP sample.\n\nĐường dẫn ghi file:\nC:/Users/IYH1HC/Desktop/AI/OctoAgent/pi-boi-main/core-service/workspacerks/sessions/79ce2909-4c31-43b2-8ecb-90e489281520/scratch/sample_abap.abap\n\nNội dung file:\n```\nREPORT z_sample_abap.\n\nPARAMETERS: p_name TYPE string.\n\nSTART-OF-SELECTION.\n  IF p_name IS INITIAL.\n    WRITE: / 'Hello ABAP world!'.\n  ELSE.\n    WRITE: / 'Hello, ', p_name, '!'.\n  ENDIF.\n```\n\nBạn muốn thêm tính năng gì vào mẫu (ví dụ: đọc từ bảng nội bộ, xuất ra ALV, tối ưu cho SAP HANA, v.v.) hãy cho mình biết."
+        }
+      ],
+      "api": "openai-completions",
+      "provider": "openai",
+      "model": "gpt-5-nano-2025-08-07",
+      "usage": {
+        "input": 3326,
+        "output": 1867,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 5193,
+        "cost": {
+          "input": 0.00196234,
+          "output": 0.0014749300000000002,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0.00343727
+        }
+      },
+      "stopReason": "stop",
+      "timestamp": 1776224421176
+    }
+  ],
+  "newUserMessage": "[2026-04-15 10:40:57+07:00] [user]: đính kèm file vào khung chat để mình mở",
+  "imageAttachmentCount": 0
+}

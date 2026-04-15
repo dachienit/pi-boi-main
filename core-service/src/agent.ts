@@ -471,10 +471,13 @@ export function getOrCreateRunner(sandboxConfig: SandboxConfig, channelId: strin
 function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDir: string): AgentRunner {
 	const executor = createExecutor(sandboxConfig);
 	// channelDir is workspace/sessions/{channelId} — workspace is two levels up
-	const workspacePath = executor.getWorkspacePath(dirname(dirname(channelDir)));
+	// hostWorkingDir: actual path on host filesystem (for Node.js fs operations)
+	// workspacePath: path as seen by executor (Docker: /workspace, Host: same as hostWorkingDir)
+	const hostWorkingDir = dirname(dirname(channelDir));
+	const workspacePath = executor.getWorkspacePath(hostWorkingDir);
 
-	// Create tools
-	const tools = createMomTools(executor);
+	// Create tools with host working directory for fs operations
+	const tools = createMomTools(executor, hostWorkingDir);
 
 	// Initial system prompt (will be updated each run with fresh memory/channels/users/skills)
 	const memory = getMemory(channelDir);

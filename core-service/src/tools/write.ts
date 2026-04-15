@@ -10,7 +10,12 @@ const writeSchema = Type.Object({
 	content: Type.String({ description: "Content to write to the file" }),
 });
 
-export function createWriteTool(executor: Executor): AgentTool<typeof writeSchema> {
+/**
+ * Create write tool with working directory context.
+ * @param _executor - Executor (unused, kept for API compatibility)
+ * @param workingDir - Absolute path to the working directory (for resolving relative paths)
+ */
+export function createWriteTool(_executor: Executor, workingDir: string): AgentTool<typeof writeSchema> {
 	return {
 		name: "write",
 		label: "write",
@@ -23,7 +28,8 @@ export function createWriteTool(executor: Executor): AgentTool<typeof writeSchem
 			_signal?: AbortSignal,
 		) => {
 			// Use Node.js fs APIs for cross-platform compatibility (Windows + Linux)
-			const resolvedPath = isAbsolute(filePath) ? filePath : resolve(process.cwd(), filePath);
+			// Resolve relative paths against workingDir, not process.cwd()
+			const resolvedPath = isAbsolute(filePath) ? filePath : resolve(workingDir, filePath);
 			const dir = dirname(resolvedPath);
 
 			try {
