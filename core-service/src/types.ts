@@ -34,6 +34,61 @@ export interface BotEvent {
 }
 
 // ============================================================================
+// Streaming step / pipeline events (claude.ai-style live activity)
+// ============================================================================
+
+export type StepKind = "oauth" | "history" | "fetch_dia" | "tool" | "iter";
+
+export interface StepStartEvent {
+	id: string;
+	kind: StepKind;
+	label: string;
+	parentId?: string;
+	args?: unknown;
+}
+
+export interface StepEndEvent {
+	id: string;
+	status: "ok" | "error";
+	durationMs: number;
+	summary?: string;
+	output?: unknown;
+}
+
+export interface DiaPipelineSubStep {
+	name: string;
+	nodeType: string;
+	executionTimeMs: number;
+	friendlyLabel: string;
+}
+
+export interface DiaPipelineEvent {
+	parentStepId: string;
+	subSteps: DiaPipelineSubStep[];
+}
+
+export interface RagSource {
+	title: string;
+	similarityScore: number;
+	sourceUrl: string;
+	snippet: string;
+}
+
+export interface RagSourcesEvent {
+	parentStepId: string;
+	sources: RagSource[];
+}
+
+export interface LlmMetaEvent {
+	parentStepId: string;
+	model: string;
+	temperature?: number;
+	promptTokens: number;
+	completionTokens: number;
+	totalTokens: number;
+}
+
+// ============================================================================
 // Bot context (what the agent runner uses to respond)
 // ============================================================================
 
@@ -57,6 +112,17 @@ export interface BotContext {
 	uploadFile: (filePath: string, title?: string) => Promise<void>;
 	setWorking: (working: boolean) => Promise<void>;
 	deleteMessage: () => Promise<void>;
+	/** Granular activity-timeline emit (start of a sub-step). Optional: only HTTP adapter wires it. */
+	emitStepStart?: (event: StepStartEvent) => void;
+	emitStepEnd?: (event: StepEndEvent) => void;
+	/** Post-hoc DIA pipeline breakdown after the blocking DIA call returns. */
+	emitDiaPipeline?: (event: DiaPipelineEvent) => void;
+	/** Top-K RAG embeddings extracted from the DIA debug payload. */
+	emitRagSources?: (event: RagSourcesEvent) => void;
+	/** LLM model + token usage extracted from the DIA debug payload. */
+	emitLlmMeta?: (event: LlmMetaEvent) => void;
+	/** Raw text chunk for synthetic typewriter effect (drives `delta` SSE event). */
+	emitDelta?: (text: string) => void;
 }
 
 // ============================================================================

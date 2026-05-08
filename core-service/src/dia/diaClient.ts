@@ -1,16 +1,40 @@
 import { Agent, fetch } from "undici";
 
+export type DiaPhase = "oauth" | "history" | "fetch";
+
+export interface DiaPhaseEvent {
+	phase: DiaPhase;
+	stage: "start" | "end";
+	durationMs?: number;
+	cached?: boolean;
+	error?: string;
+}
+
 export interface ChatWithDIAArgs {
 	prompt: string;
 	customMessageBehaviour: string;
 	channelId: string;
 	mode?: "rag" | "pure";
 	signal?: AbortSignal;
+	/** Optional callback fired around each network phase (oauth, history, fetch). */
+	onPhase?: (event: DiaPhaseEvent) => void;
+}
+
+/**
+ * Raw debug step shape returned by DIA Brain when `debugStepDetailsEnabled: true`.
+ * We keep it loose because the inner `details` payload varies per node type.
+ */
+export interface DiaDebugStep {
+	stepId: string;
+	stepName: string;
+	executionTimeMs: number;
+	details?: Record<string, unknown>;
 }
 
 export interface ChatWithDIAResponse {
 	result: string;
 	chatHistoryId: string;
+	debugSteps?: DiaDebugStep[];
 }
 
 interface TokenCache {
@@ -67,18 +91,35 @@ async function fetchOAuth2Token(): Promise<{ accessToken: string; expiresIn: num
 	};
 }
 
-async function getTokenCached(): Promise<string> {
+async function getTokenCached(onPhase?: ChatWithDIAArgs["onPhase"]): Promise<string> {
 	const now = Date.now();
 	if (tokenCache.accessToken && now < tokenCache.expiresAt - 60_000) {
+		// Cache hit — emit a synthetic 0ms event so the UI still shows the step.
+		onPhase?.({ phase: "oauth", stage: "start", cached: true });
+		onPhase?.({ phase: "oauth", stage: "end", durationMs: 0, cached: true });
 		return tokenCache.accessToken;
 	}
 
-	const token = await fetchOAuth2Token();
-	tokenCache = {
-		accessToken: token.accessToken,
-		expiresAt: now + token.expiresIn * 1000,
-	};
-	return token.accessToken;
+	onPhase?.({ phase: "oauth", stage: "start", cached: false });
+	const t0 = Date.now();
+	try {
+		const token = await fetchOAuth2Token();
+		tokenCache = {
+			accessToken: token.accessToken,
+			expiresAt: now + token.expiresIn * 1000,
+		};
+		onPhase?.({ phase: "oauth", stage: "end", durationMs: Date.now() - t0, cached: false });
+		return token.accessToken;
+	} catch (err) {
+		onPhase?.({
+			phase: "oauth",
+			stage: "end",
+			durationMs: Date.now() - t0,
+			cached: false,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		throw err;
+	}
 }
 
 async function createHistoryRemote(brainId: string, token: string): Promise<string> {
@@ -101,13 +142,37 @@ async function createHistoryRemote(brainId: string, token: string): Promise<stri
 	return historyId.replace(/^"|"$/g, "");
 }
 
-async function getOrCreateHistory(channelId: string, brainId: string, token: string): Promise<string> {
+async function getOrCreateHistory(
+	channelId: string,
+	brainId: string,
+	token: string,
+	onPhase?: ChatWithDIAArgs["onPhase"],
+): Promise<string> {
 	const cached = historyMap.get(channelId);
-	if (cached) return cached;
-	const historyId = await createHistoryRemote(brainId, token);
-	historyMap.set(channelId, historyId);
-	console.log(`[DIA] New history ${historyId} for channel ${channelId}`);
-	return historyId;
+	if (cached) {
+		onPhase?.({ phase: "history", stage: "start", cached: true });
+		onPhase?.({ phase: "history", stage: "end", durationMs: 0, cached: true });
+		return cached;
+	}
+
+	onPhase?.({ phase: "history", stage: "start", cached: false });
+	const t0 = Date.now();
+	try {
+		const historyId = await createHistoryRemote(brainId, token);
+		historyMap.set(channelId, historyId);
+		console.log(`[DIA] New history ${historyId} for channel ${channelId}`);
+		onPhase?.({ phase: "history", stage: "end", durationMs: Date.now() - t0, cached: false });
+		return historyId;
+	} catch (err) {
+		onPhase?.({
+			phase: "history",
+			stage: "end",
+			durationMs: Date.now() - t0,
+			cached: false,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		throw err;
+	}
 }
 
 export function resetHistory(channelId: string): void {
@@ -115,7 +180,7 @@ export function resetHistory(channelId: string): void {
 }
 
 export async function chatWithDIA(args: ChatWithDIAArgs): Promise<ChatWithDIAResponse> {
-	const { prompt, customMessageBehaviour, channelId, mode = "rag", signal } = args;
+	const { prompt, customMessageBehaviour, channelId, mode = "rag", signal, onPhase } = args;
 
 	const brainId = process.env.BRAIN_ID?.replace(/"/g, "").trim();
 	if (!brainId) throw new Error("BRAIN_ID is not configured in .env");
@@ -127,41 +192,74 @@ export async function chatWithDIA(args: ChatWithDIAArgs): Promise<ChatWithDIARes
 		throw new Error(`DIA endpoint for mode '${mode}' is not configured in .env`);
 	}
 
-	const token = await getTokenCached();
-	const chatHistoryId = await getOrCreateHistory(channelId, brainId, token);
+	const token = await getTokenCached(onPhase);
+	const chatHistoryId = await getOrCreateHistory(channelId, brainId, token, onPhase);
 
 	const body = {
 		prompt,
 		customMessageBehaviour,
 		knowledgeBaseId: brainId,
 		chatHistoryId,
+		debugStepDetailsEnabled: true,
 		useGptKnowledge: true,
 	};
 
+	onPhase?.({ phase: "fetch", stage: "start" });
 	const t0 = Date.now();
-	const response = await fetch(endpoint, {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${token}`,
-			"Content-Type": "application/json",
-			Accept: "application/json",
-		},
-		body: JSON.stringify(body),
-		signal,
-	});
+	let response;
+	try {
+		response = await fetch(endpoint, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "application/json",
+				Accept: "application/json",
+			},
+			body: JSON.stringify(body),
+			signal,
+		});
+	} catch (err) {
+		onPhase?.({
+			phase: "fetch",
+			stage: "end",
+			durationMs: Date.now() - t0,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		throw err;
+	}
 
 	if (response.status !== 200) {
 		const errorText = await response.text();
+		onPhase?.({
+			phase: "fetch",
+			stage: "end",
+			durationMs: Date.now() - t0,
+			error: `HTTP ${response.status}: ${errorText.slice(0, 200)}`,
+		});
 		throw new Error(`DIA chat (${mode}) failed: ${response.status} - ${errorText}`);
 	}
 
-	const data = (await response.json()) as { result?: string };
+	const data = (await response.json()) as {
+		result?: string;
+		debugReportDTO?: { debugSteps?: DiaDebugStep[] };
+	};
 	if (!data.result) {
+		onPhase?.({
+			phase: "fetch",
+			stage: "end",
+			durationMs: Date.now() - t0,
+			error: "missing 'result' field",
+		});
 		throw new Error("DIA chat response missing 'result' field");
 	}
 
 	const elapsed = Date.now() - t0;
 	console.log(`[DIA] ${mode.toUpperCase()} ok ${elapsed}ms (history=${chatHistoryId.slice(0, 8)}…)`);
+	onPhase?.({ phase: "fetch", stage: "end", durationMs: elapsed });
 
-	return { result: data.result, chatHistoryId };
+	return {
+		result: data.result,
+		chatHistoryId,
+		debugSteps: data.debugReportDTO?.debugSteps,
+	};
 }

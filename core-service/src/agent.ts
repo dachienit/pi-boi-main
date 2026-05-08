@@ -31,6 +31,7 @@ import { createExecutor, type SandboxConfig } from "./sandbox.js";
 import type { BotContext, ChannelInfo, UserInfo } from "./types.js";
 import type { ChannelStore } from "./store.js";
 import { createMomTools, setUploadFunction } from "./tools/index.js";
+import { clearDiaEmitters, setDiaEmitters } from "./tools/dia.js";
 
 // Model configuration via environment variables:
 //   LLM_PROVIDER  — provider name (default: "openai")
@@ -588,6 +589,10 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		errorMessage: undefined as string | undefined,
 		diaFinalDisplay: undefined as string | undefined,
 		diaShortCircuited: false,
+		// True when DIA's display text was streamed inline via emitDelta (typewriter).
+		// Suppresses the trailing replaceMessage so we don't push a duplicate text
+		// block AFTER the tool cards in the activity flow.
+		diaStreamedInline: false,
 	};
 
 	// Subscribe to events ONCE
@@ -653,14 +658,24 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				agentEvent.result !== null &&
 				"details" in agentEvent.result
 			) {
-				const details = (agentEvent.result as { details?: { shortCircuit?: boolean; finalDiaDisplay?: string } })
-					.details;
+				const details = (
+					agentEvent.result as {
+						details?: { shortCircuit?: boolean; finalDiaDisplay?: string; streamedInline?: boolean };
+					}
+				).details;
 				if (details?.shortCircuit && details.finalDiaDisplay) {
 					const finalText = details.finalDiaDisplay;
 					runState.diaFinalDisplay = finalText;
 					runState.diaShortCircuited = true;
+					runState.diaStreamedInline = Boolean(details.streamedInline);
 					log.logResponse(logCtx, finalText);
-					queue.enqueueMessage(finalText, "main", "dia final response");
+					// When DIA already streamed text inline via emitDelta, the user has seen
+					// the full response token-by-token. Skip the duplicate enqueueMessage to
+					// avoid posting the same text twice — the trailing replaceMessage at the
+					// end of run() is also suppressed (see runState.diaStreamedInline check).
+					if (!details.streamedInline) {
+						queue.enqueueMessage(finalText, "main", "dia final response");
+					}
 					queue.enqueueMessage(finalText, "thread", "dia final thread", false);
 					session.abort();
 				}
@@ -800,6 +815,18 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				await ctx.uploadFile(hostPath, title);
 			});
 
+			// Wire DIA streaming emitters → SSE (per-run, cleared in finally below).
+			// Adapter (HTTP) provides emit* methods; Slack adapter omits them so DIA
+			// just falls back to its existing onUpdate progress log.
+			setDiaEmitters({
+				emitStepStart: ctx.emitStepStart,
+				emitStepEnd: ctx.emitStepEnd,
+				emitDiaPipeline: ctx.emitDiaPipeline,
+				emitRagSources: ctx.emitRagSources,
+				emitLlmMeta: ctx.emitLlmMeta,
+				emitDelta: ctx.emitDelta,
+			});
+
 			// Reset per-run state
 			runState.ctx = ctx;
 			runState.logCtx = {
@@ -819,6 +846,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			runState.errorMessage = undefined;
 			runState.diaFinalDisplay = undefined;
 			runState.diaShortCircuited = false;
+			runState.diaStreamedInline = false;
 
 			// Create queue for this run
 			let queueChain = Promise.resolve();
@@ -918,16 +946,26 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			} else if (runState.diaShortCircuited && runState.diaFinalDisplay) {
 				// DIA short-circuit: use the cached final display, ignore lastAssistant
 				// (it is empty / aborted because we cancelled nano's 2nd LLM call).
-				const finalText: string = runState.diaFinalDisplay;
-				try {
-					const mainText =
-						finalText.length > SLACK_MAX_LENGTH
-							? `${finalText.substring(0, SLACK_MAX_LENGTH - 50)}\n\n_(see thread for full response)_`
-							: finalText;
-					await ctx.replaceMessage(mainText);
-				} catch (err) {
-					const errMsg = err instanceof Error ? err.message : String(err);
-					log.logWarning("Failed to replace message with DIA final display", errMsg);
+				//
+				// When DIA already typewrote the text inline (the new flow), the user
+				// has the full response visible IN POSITION (between iter card and tool
+				// cards). Calling replaceMessage now would push a duplicate text block
+				// at the END of the flow — visually a "pop" of duplicate text after
+				// the tool cards. So skip it; the inline-streamed text is canonical.
+				if (runState.diaStreamedInline) {
+					log.logInfo("DIA: text already streamed inline via typewriter, skipping replaceMessage");
+				} else {
+					const finalText: string = runState.diaFinalDisplay;
+					try {
+						const mainText =
+							finalText.length > SLACK_MAX_LENGTH
+								? `${finalText.substring(0, SLACK_MAX_LENGTH - 50)}\n\n_(see thread for full response)_`
+								: finalText;
+						await ctx.replaceMessage(mainText);
+					} catch (err) {
+						const errMsg = err instanceof Error ? err.message : String(err);
+						log.logWarning("Failed to replace message with DIA final display", errMsg);
+					}
 				}
 			} else {
 				// Final message update
@@ -988,6 +1026,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			runState.ctx = null;
 			runState.logCtx = null;
 			runState.queue = null;
+			clearDiaEmitters();
 
 			return { stopReason: runState.stopReason, errorMessage: runState.errorMessage };
 		},

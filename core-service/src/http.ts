@@ -2,7 +2,15 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statS
 import { basename, isAbsolute, join, normalize } from "path";
 import express from "express";
 import * as log from "./log.js";
-import type { BotContext, BotHandler } from "./types.js";
+import type {
+	BotContext,
+	BotHandler,
+	DiaPipelineEvent,
+	LlmMetaEvent,
+	RagSourcesEvent,
+	StepEndEvent,
+	StepStartEvent,
+} from "./types.js";
 
 /**
  * Normalize a file path for the current OS.
@@ -108,6 +116,30 @@ function createHttpContext(opts: {
 		deleteMessage: async () => {
 			send({ type: "delete" });
 		},
+
+		emitStepStart: (event: StepStartEvent) => {
+			send({ type: "step_start", ...event });
+		},
+
+		emitStepEnd: (event: StepEndEvent) => {
+			send({ type: "step_end", ...event });
+		},
+
+		emitDiaPipeline: (event: DiaPipelineEvent) => {
+			send({ type: "dia_pipeline", ...event });
+		},
+
+		emitRagSources: (event: RagSourcesEvent) => {
+			send({ type: "rag_sources", ...event });
+		},
+
+		emitLlmMeta: (event: LlmMetaEvent) => {
+			send({ type: "llm_meta", ...event });
+		},
+
+		emitDelta: (chunk: string) => {
+			send({ type: "delta", text: chunk });
+		},
 	};
 }
 
@@ -129,14 +161,19 @@ function createHttpContext(opts: {
  *   GET  /artifacts/*                                         → static files from {workingDir}/artifacts/
  *
  * SSE event shapes:
- *   { type: "status",  status: "thinking"|"working"|"idle"|"stopped" }
- *   { type: "delta",   text: string }
- *   { type: "replace", text: string }
- *   { type: "thread",  text: string }
- *   { type: "file",    path: string, title?: string }
+ *   { type: "status",       status: "thinking"|"working"|"idle"|"stopped" }
+ *   { type: "delta",        text: string }
+ *   { type: "replace",      text: string }
+ *   { type: "thread",       text: string }
+ *   { type: "file",         path: string, title?: string }
  *   { type: "delete" }
- *   { type: "done",    stopReason: string }
- *   { type: "error",   message: string }
+ *   { type: "done",         stopReason: string }
+ *   { type: "error",        message: string }
+ *   { type: "step_start",   id, kind: "oauth"|"history"|"fetch_dia"|"tool"|"iter", label, parentId?, args? }
+ *   { type: "step_end",     id, status: "ok"|"error", durationMs, summary?, output? }
+ *   { type: "dia_pipeline", parentStepId, subSteps: [{ name, nodeType, executionTimeMs, friendlyLabel }] }
+ *   { type: "rag_sources",  parentStepId, sources: [{ title, similarityScore, sourceUrl, snippet }] }
+ *   { type: "llm_meta",     parentStepId, model, temperature?, promptTokens, completionTokens, totalTokens }
  */
 export class HttpServer {
 	private port: number;
@@ -327,7 +364,144 @@ export class HttpServer {
 
 	private handleMessages(channelId: string, res: express.Response): void {
 		type ContextEntry = { type: string; timestamp?: string; message?: Record<string, any> };
-		type ChatMessage = { role: "user" | "assistant"; text: string; attachments?: string[]; thread?: string; files?: Array<{ path: string; title?: string }> };
+		// TimelineStep mirrors the frontend AgentActivityTimeline.TimelineStep shape.
+		// Sent over the wire as JSON; the web-ui maps it directly into <agent-activity-timeline>.
+		type TimelineStep = {
+			id: string;
+			kind: "oauth" | "history" | "fetch_dia" | "tool" | "iter";
+			label: string;
+			parentId?: string;
+			status: "ok" | "error";
+			durationMs?: number;
+			summary?: string;
+			subSteps?: Array<Record<string, unknown>>;
+			ragSources?: Array<Record<string, unknown>>;
+			llmMeta?: Record<string, unknown>;
+		};
+		// FlowBlock interleaves activity-card groups with assistant display text so
+		// the web-ui can render claude.ai-style: card → text → card → card → text...
+		type FlowBlock =
+			| { type: "steps"; steps: TimelineStep[] }
+			| { type: "text"; text: string };
+		type ChatMessage = {
+			role: "user" | "assistant";
+			text: string;
+			attachments?: string[];
+			thread?: string;
+			files?: Array<{ path: string; title?: string }>;
+			flow?: FlowBlock[];
+		};
+
+		// Rebuild interleaved FlowBlock[] from the persisted details.timeline payload
+		// of a callDIABrain toolResult. Stable IDs are derived from the parent
+		// toolCallId + iteration / phase / tool index so re-renders don't churn.
+		//
+		// Per iteration:
+		//   - if `displayText` is present (new sessions): emit
+		//       { steps: [iter + phases] }, { text: displayText }, { steps: [tool] }*
+		//     so each tool becomes its own top-level card AFTER the text.
+		//   - else (legacy sessions, pre-Phase 8.5): emit one nested
+		//       { steps: [iter + phases + tools-with-parentId] } block so the
+		//       layout matches the old monolithic timeline card.
+		//
+		// When NO iteration carried `displayText` and `finalDiaDisplay` exists, it
+		// is appended as a trailing { text } block so legacy sessions still show
+		// the assistant's response below the activity card.
+		const rebuildFlow = (
+			toolCallId: string,
+			persisted: any[],
+			finalDiaDisplay?: string,
+		): FlowBlock[] => {
+			const out: FlowBlock[] = [];
+			let anyDisplayText = false;
+
+			persisted.forEach((iter, i) => {
+				if (!iter || typeof iter !== "object") return;
+				const iterId = `${toolCallId}-iter-${i}`;
+				const iterStep: TimelineStep = {
+					id: iterId,
+					kind: "iter",
+					label: typeof iter.label === "string" ? iter.label : `DIA iteration ${i + 1}`,
+					status: iter.status === "error" ? "error" : "ok",
+					durationMs: typeof iter.durationMs === "number" ? iter.durationMs : undefined,
+					summary: typeof iter.summary === "string" ? iter.summary : undefined,
+					subSteps: Array.isArray(iter.pipeline) ? iter.pipeline : undefined,
+					ragSources: Array.isArray(iter.ragSources) ? iter.ragSources : undefined,
+					llmMeta: iter.llmMeta && typeof iter.llmMeta === "object" ? iter.llmMeta : undefined,
+				};
+
+				const phaseSteps: TimelineStep[] = [];
+				for (const phase of Array.isArray(iter.phases) ? iter.phases : []) {
+					if (!phase || typeof phase !== "object") continue;
+					const phaseKind = phase.phase as TimelineStep["kind"];
+					if (phaseKind !== "oauth" && phaseKind !== "history" && phaseKind !== "fetch_dia") continue;
+					phaseSteps.push({
+						id: `${iterId}-phase-${phase.phase}`,
+						kind: phaseKind,
+						label: typeof phase.label === "string" ? phase.label : phase.phase,
+						parentId: iterId,
+						status: phase.status === "error" ? "error" : "ok",
+						durationMs: typeof phase.durationMs === "number" ? phase.durationMs : undefined,
+						summary: typeof phase.summary === "string" ? phase.summary : undefined,
+					});
+				}
+
+				const toolList = Array.isArray(iter.tools) ? iter.tools : [];
+				const displayText = typeof iter.displayText === "string" ? iter.displayText.trim() : "";
+
+				if (displayText) {
+					anyDisplayText = true;
+					// NEW interleaved layout: iter card → display text → per-tool cards.
+					out.push({ type: "steps", steps: [iterStep, ...phaseSteps] });
+					out.push({ type: "text", text: displayText });
+					toolList.forEach((tool: any, j: number) => {
+						if (!tool || typeof tool !== "object") return;
+						const toolStep: TimelineStep = {
+							id: `${iterId}-tool-${j}`,
+							kind: "tool",
+							label:
+								typeof tool.label === "string"
+									? tool.label
+									: typeof tool.tool === "string"
+										? tool.tool
+										: "tool",
+							// NO parentId -- top-level card sitting AFTER the text.
+							status: tool.status === "error" ? "error" : "ok",
+							durationMs: typeof tool.durationMs === "number" ? tool.durationMs : undefined,
+							summary: typeof tool.summary === "string" ? tool.summary : undefined,
+						};
+						out.push({ type: "steps", steps: [toolStep] });
+					});
+				} else {
+					// LEGACY nested layout for sessions written before displayText capture.
+					const nestedTools: TimelineStep[] = toolList
+						.filter((t: any) => t && typeof t === "object")
+						.map((tool: any, j: number) => ({
+							id: `${iterId}-tool-${j}`,
+							kind: "tool",
+							label:
+								typeof tool.label === "string"
+									? tool.label
+									: typeof tool.tool === "string"
+										? tool.tool
+										: "tool",
+							parentId: iterId,
+							status: tool.status === "error" ? "error" : "ok",
+							durationMs: typeof tool.durationMs === "number" ? tool.durationMs : undefined,
+							summary: typeof tool.summary === "string" ? tool.summary : undefined,
+						}));
+					out.push({ type: "steps", steps: [iterStep, ...phaseSteps, ...nestedTools] });
+				}
+			});
+
+			// Legacy fallback: trailing text block from finalDiaDisplay when no iter
+			// supplied displayText (pre-Phase 8.5 sessions or non-JSON DIA replies).
+			if (!anyDisplayText && finalDiaDisplay && finalDiaDisplay.trim()) {
+				out.push({ type: "text", text: finalDiaDisplay.trim() });
+			}
+
+			return out;
+		};
 
 		const formatArgs = (args: Record<string, any>): string => {
 			const lines: string[] = [];
@@ -358,7 +532,13 @@ export class HttpServer {
 				}
 
 				type ToolCall = { id: string; name: string; label?: string; args: Record<string, any> };
-				type ToolResult = { toolCallId: string; toolName: string; text: string; isError: boolean };
+				type ToolResult = {
+					toolCallId: string;
+					toolName: string;
+					text: string;
+					isError: boolean;
+					details?: Record<string, any>;
+				};
 				type Turn = { userText: string; attachments: string[]; toolCalls: ToolCall[]; toolResults: ToolResult[]; assistantTexts: string[] };
 
 				const stripPrefix = (text: string) =>
@@ -396,16 +576,23 @@ export class HttpServer {
 						if (turns.length === 0) continue;
 						const turn = turns[turns.length - 1];
 						const text = (msg.content as any[])?.find((c: any) => c.type === "text")?.text ?? "";
-						turn.toolResults.push({ toolCallId: msg.toolCallId, toolName: msg.toolName, text, isError: msg.isError });
+						turn.toolResults.push({
+							toolCallId: msg.toolCallId,
+							toolName: msg.toolName,
+							text,
+							isError: msg.isError,
+							details: msg.details as Record<string, any> | undefined,
+						});
 					}
 				}
 
 				for (const turn of turns) {
 					messages.push({ role: "user", text: turn.userText, attachments: turn.attachments.length > 0 ? turn.attachments : undefined });
 
-					const mainText = turn.assistantTexts[turn.assistantTexts.length - 1] ?? "";
+					let mainText = turn.assistantTexts[turn.assistantTexts.length - 1] ?? "";
 					const threadParts: string[] = [];
 					const files: Array<{ path: string; title?: string }> = [];
+					const flowBlocks: FlowBlock[] = [];
 
 					for (const tc of turn.toolCalls) {
 						const result = turn.toolResults.find((r) => r.toolCallId === tc.id);
@@ -423,11 +610,41 @@ export class HttpServer {
 							const normalizedPath = normalizeFilePath(tc.args.path as string, this.workingDir);
 							files.push({ path: normalizedPath, title: tc.args.title as string | undefined });
 						}
+
+						// callDIABrain runs `attach` nested in its sub-loop, so the file paths
+						// only live in the toolResult's `details.attachedFiles`. Lift them up
+						// here so chips re-appear on page refresh. Likewise, fall back to the
+						// DIA `display` text when the assistant message body is empty (which
+						// happens whenever short-circuit aborts nano before it emits text).
+						if (tc.name === "callDIABrain" && result?.details) {
+							const details = result.details;
+							const nested = Array.isArray(details.attachedFiles) ? details.attachedFiles : [];
+							for (const f of nested) {
+								if (f && typeof f.path === "string") {
+									const normalizedPath = normalizeFilePath(f.path, this.workingDir);
+									files.push({ path: normalizedPath, title: typeof f.title === "string" ? f.title : undefined });
+								}
+							}
+							if (!mainText && typeof details.finalDiaDisplay === "string" && details.finalDiaDisplay.trim()) {
+								mainText = details.finalDiaDisplay.trim();
+							}
+							if (Array.isArray(details.timeline) && details.timeline.length > 0) {
+								const finalDisplay =
+									typeof details.finalDiaDisplay === "string" ? details.finalDiaDisplay : undefined;
+								flowBlocks.push(...rebuildFlow(tc.id, details.timeline, finalDisplay));
+							}
+						}
 					}
 
 					const thread = threadParts.length > 0 ? threadParts.join("\n\n") : undefined;
-					if (mainText || thread) {
-						messages.push({ role: "assistant", text: mainText, thread, files: files.length > 0 ? files : undefined });
+					if (mainText || thread || flowBlocks.length > 0) {
+						messages.push({
+							role: "assistant",
+							text: mainText,
+							thread,
+							files: files.length > 0 ? files : undefined,
+							flow: flowBlocks.length > 0 ? flowBlocks : undefined,
+						});
 					}
 				}
 			} catch { /* unreadable file */ }
