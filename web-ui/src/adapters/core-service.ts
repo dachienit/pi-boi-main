@@ -1,3 +1,59 @@
+export type StepKind = "oauth" | "history" | "fetch_dia" | "tool" | "iter";
+
+export interface StepStartEvent {
+	type: "step_start";
+	id: string;
+	kind: StepKind;
+	label: string;
+	parentId?: string;
+	args?: unknown;
+}
+
+export interface StepEndEvent {
+	type: "step_end";
+	id: string;
+	status: "ok" | "error";
+	durationMs: number;
+	summary?: string;
+	output?: unknown;
+}
+
+export interface DiaPipelineSubStep {
+	name: string;
+	nodeType: string;
+	executionTimeMs: number;
+	friendlyLabel: string;
+}
+
+export interface DiaPipelineEvent {
+	type: "dia_pipeline";
+	parentStepId: string;
+	subSteps: DiaPipelineSubStep[];
+}
+
+export interface RagSource {
+	title: string;
+	similarityScore: number;
+	sourceUrl: string;
+	snippet: string;
+}
+
+export interface RagSourcesEvent {
+	type: "rag_sources";
+	parentStepId: string;
+	sources: RagSource[];
+}
+
+export interface LlmMetaEvent {
+	type: "llm_meta";
+	parentStepId: string;
+	model: string;
+	temperature?: number;
+	promptTokens: number;
+	completionTokens: number;
+	totalTokens: number;
+}
+
 export type SseEvent =
 	| { type: "status"; status: "thinking" | "working" | "idle" | "stopped" }
 	| { type: "delta"; text: string }
@@ -6,7 +62,12 @@ export type SseEvent =
 	| { type: "file"; path: string; title?: string }
 	| { type: "delete" }
 	| { type: "done" }
-	| { type: "error"; message: string };
+	| { type: "error"; message: string }
+	| StepStartEvent
+	| StepEndEvent
+	| DiaPipelineEvent
+	| RagSourcesEvent
+	| LlmMetaEvent;
 
 export type AttachmentPayload = {
 	fileName: string;

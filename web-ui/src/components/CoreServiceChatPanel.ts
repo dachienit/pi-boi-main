@@ -8,6 +8,15 @@ import "./MessageEditor.js";
 import "./SandboxedIframe.js";
 import type { SandboxIframe } from "./SandboxedIframe.js";
 import "@mariozechner/mini-lit/dist/MarkdownBlock.js";
+import {
+	applyDiaPipeline,
+	applyLlmMeta,
+	applyRagSources,
+	applyStepEnd,
+	applyStepStart,
+	type TimelineStep,
+} from "./AgentActivityTimeline.js";
+import "./AgentActivityTimeline.js";
 
 // ============================================================================
 // File viewer sub-component
@@ -109,12 +118,105 @@ class CoreServiceFileViewer extends LitElement {
 	}
 }
 
+type FileRef = { path: string; title?: string };
+
+/**
+ * FlowBlock interleaves activity-card groups with assistant display text so the
+ * UI can render claude.ai-style: card → text → card → card → text...
+ *
+ * Wire format from /messages and live SSE events both produce FlowBlock[].
+ */
+export type FlowBlock =
+	| { type: "steps"; steps: TimelineStep[] }
+	| { type: "text"; text: string };
+
 type ChatMessage =
 	| { role: "user"; text: string; attachments?: string[] }
-	| { role: "assistant"; text: string; thread?: string; files?: FileRef[] }
+	| {
+			role: "assistant";
+			text: string;
+			thread?: string;
+			files?: FileRef[];
+			flow?: FlowBlock[];
+			timeline?: TimelineStep[]; // legacy (pre-flow sessions)
+		}
 	| { role: "error"; text: string };
 
-type FileRef = { path: string; title?: string };
+// ============================================================================
+// Flow mutation helpers (immutable — return new arrays so Lit re-renders)
+// ============================================================================
+
+function pushStepsBlock(flow: FlowBlock[], step: TimelineStep): FlowBlock[] {
+	return [...flow, { type: "steps", steps: [step] }];
+}
+
+function appendPhaseToBlock(
+	flow: FlowBlock[],
+	parentId: string,
+	phase: TimelineStep,
+): FlowBlock[] {
+	let mutated = false;
+	const out = flow.map((block) => {
+		if (mutated || block.type !== "steps" || block.steps.length === 0) return block;
+		if (block.steps[0].id !== parentId) return block;
+		mutated = true;
+		return { ...block, steps: [...block.steps, phase] };
+	});
+	if (!mutated) {
+		// Parent block not found — emit phase as its own block so it isn't lost.
+		return [...flow, { type: "steps", steps: [phase] }];
+	}
+	return out;
+}
+
+function mutateStepInFlow(
+	flow: FlowBlock[],
+	stepId: string,
+	mutate: (step: TimelineStep) => TimelineStep,
+): FlowBlock[] {
+	let touched = false;
+	const out = flow.map((block) => {
+		if (touched || block.type !== "steps") return block;
+		const idx = block.steps.findIndex((s) => s.id === stepId);
+		if (idx < 0) return block;
+		touched = true;
+		const newSteps = block.steps.slice();
+		newSteps[idx] = mutate(newSteps[idx]);
+		return { ...block, steps: newSteps };
+	});
+	return touched ? out : flow;
+}
+
+function appendDelta(flow: FlowBlock[], chunk: string): FlowBlock[] {
+	const last = flow[flow.length - 1];
+	if (last && last.type === "text") {
+		const head = flow.slice(0, -1);
+		return [...head, { type: "text", text: last.text + chunk }];
+	}
+	return [...flow, { type: "text", text: chunk }];
+}
+
+function replaceLastText(flow: FlowBlock[], text: string): FlowBlock[] {
+	const last = flow[flow.length - 1];
+	if (last && last.type === "text") {
+		const head = flow.slice(0, -1);
+		return [...head, { type: "text", text }];
+	}
+	return [...flow, { type: "text", text }];
+}
+
+function clearTextBlocks(flow: FlowBlock[]): FlowBlock[] {
+	const filtered = flow.filter((b) => b.type !== "text");
+	return filtered.length === flow.length ? flow : filtered;
+}
+
+function flowToText(flow: FlowBlock[]): string {
+	return flow
+		.filter((b): b is { type: "text"; text: string } => b.type === "text")
+		.map((b) => b.text)
+		.join("\n\n")
+		.trim();
+}
 
 @customElement("core-service-chat-panel")
 export class CoreServiceChatPanel extends LitElement {
@@ -123,7 +225,7 @@ export class CoreServiceChatPanel extends LitElement {
 	@property() declare userName: string | undefined;
 
 	@state() private declare messages: ChatMessage[];
-	@state() private declare streamingText: string;
+	@state() private declare streamingFlow: FlowBlock[];
 	@state() private declare streamingThread: string;
 	@state() private declare streamingStatus: string;
 	@state() private declare streamingFiles: FileRef[];
@@ -144,7 +246,7 @@ export class CoreServiceChatPanel extends LitElement {
 		this.channelId = "default";
 		this.userName = undefined;
 		this.messages = [];
-		this.streamingText = "";
+		this.streamingFlow = [];
 		this.streamingThread = "";
 		this.streamingStatus = "";
 		this.streamingFiles = [];
@@ -173,7 +275,7 @@ export class CoreServiceChatPanel extends LitElement {
 		if (changed.has("channelId") && changed.get("channelId") !== undefined) {
 			// channelId changed after initial connect — reset and reload
 			this.messages = [];
-			this.streamingText = "";
+			this.streamingFlow = [];
 			this.streamingThread = "";
 			this.streamingStatus = "";
 			this.streamingFiles = [];
@@ -187,7 +289,15 @@ export class CoreServiceChatPanel extends LitElement {
 
 	private async loadHistory() {
 		const msgs = await this.client.getMessages(this.channelId);
-		this.messages = msgs.map((m) => ({ role: m.role, text: m.text, thread: (m as any).thread, files: (m as any).files, attachments: (m as any).attachments }));
+		this.messages = msgs.map((m) => ({
+			role: m.role,
+			text: m.text,
+			thread: (m as any).thread,
+			files: (m as any).files,
+			attachments: (m as any).attachments,
+			flow: (m as any).flow,
+			timeline: (m as any).timeline, // legacy fallback for sessions written before flow
+		}));
 		this.autoScroll = true;
 	}
 
@@ -219,7 +329,7 @@ export class CoreServiceChatPanel extends LitElement {
 			this._editor.value = "";
 			this._editor.attachments = [];
 		}
-		this.streamingText = "";
+		this.streamingFlow = [];
 		this.streamingThread = "";
 		this.streamingStatus = "";
 		this.streamingFiles = [];
@@ -242,19 +352,27 @@ export class CoreServiceChatPanel extends LitElement {
 				this.messages = [...this.messages, { role: "error", text: String(err) }];
 			}
 		} finally {
-			const hasContent = this.streamingText || this.streamingThread || this.streamingFiles.length > 0;
+			const hasContent =
+				this.streamingFlow.length > 0 ||
+				this.streamingThread ||
+				this.streamingFiles.length > 0;
 			if (hasContent) {
+				const committedFlow = this.streamingFlow.map((b) =>
+					b.type === "steps" ? { type: "steps" as const, steps: [...b.steps] } : { ...b },
+				);
 				this.messages = [
 					...this.messages,
 					{
 						role: "assistant",
-						text: this.streamingText,
+						// Concatenated text blocks kept for any code path that still reads msg.text.
+						text: flowToText(this.streamingFlow),
 						thread: this.streamingThread || undefined,
 						files: this.streamingFiles.length > 0 ? [...this.streamingFiles] : undefined,
+						flow: committedFlow.length > 0 ? committedFlow : undefined,
 					},
 				];
 			}
-			this.streamingText = "";
+			this.streamingFlow = [];
 			this.streamingThread = "";
 			this.streamingStatus = "";
 			this.streamingFiles = [];
@@ -265,10 +383,10 @@ export class CoreServiceChatPanel extends LitElement {
 	private handleSseEvent(event: SseEvent) {
 		switch (event.type) {
 			case "delta":
-				this.streamingText += event.text;
+				this.streamingFlow = appendDelta(this.streamingFlow, event.text);
 				break;
 			case "replace":
-				this.streamingText = event.text;
+				this.streamingFlow = replaceLastText(this.streamingFlow, event.text);
 				break;
 			case "thread":
 				this.streamingThread += event.text;
@@ -280,14 +398,56 @@ export class CoreServiceChatPanel extends LitElement {
 				this.streamingFiles = [...this.streamingFiles, { path: event.path, title: event.title }];
 				break;
 			case "delete":
-				// Bot deleted its current response — clear accumulated text
-				this.streamingText = "";
+				this.streamingFlow = clearTextBlocks(this.streamingFlow);
 				break;
 			case "error":
 				this.messages = [...this.messages, { role: "error", text: event.message }];
 				break;
 			case "done":
-				// Stream ends naturally; finally block commits the message
+				break;
+			case "step_start": {
+				// Build a TimelineStep skeleton via the existing helper (so status/icons stay consistent).
+				const seeded = applyStepStart([], event);
+				const stepNode = seeded[0];
+				if (!stepNode) break;
+				if (event.parentId) {
+					// Phase / nested-tool step → graft onto the parent block.
+					this.streamingFlow = appendPhaseToBlock(this.streamingFlow, event.parentId, stepNode);
+				} else {
+					// Top-level (iter or single-pass tool) → its own card.
+					this.streamingFlow = pushStepsBlock(this.streamingFlow, stepNode);
+				}
+				break;
+			}
+			case "step_end":
+				this.streamingFlow = mutateStepInFlow(this.streamingFlow, event.id, (step) => {
+					const updated = applyStepEnd([step], event);
+					return updated[0] ?? step;
+				});
+				break;
+			case "dia_pipeline":
+				this.streamingFlow = mutateStepInFlow(this.streamingFlow, event.parentStepId, (step) => {
+					const updated = applyDiaPipeline([step], event.parentStepId, event.subSteps);
+					return updated[0] ?? step;
+				});
+				break;
+			case "rag_sources":
+				this.streamingFlow = mutateStepInFlow(this.streamingFlow, event.parentStepId, (step) => {
+					const updated = applyRagSources([step], event.parentStepId, event.sources);
+					return updated[0] ?? step;
+				});
+				break;
+			case "llm_meta":
+				this.streamingFlow = mutateStepInFlow(this.streamingFlow, event.parentStepId, (step) => {
+					const updated = applyLlmMeta([step], event.parentStepId, {
+						model: event.model,
+						temperature: event.temperature,
+						promptTokens: event.promptTokens,
+						completionTokens: event.completionTokens,
+						totalTokens: event.totalTokens,
+					});
+					return updated[0] ?? step;
+				});
 				break;
 		}
 	}
@@ -412,9 +572,21 @@ export class CoreServiceChatPanel extends LitElement {
 			`;
 		}
 		if (msg.role === "assistant") {
+			// Prefer flow when present (new sessions). Fall back to text + timeline
+			// for sessions written before the interleaved-flow refactor.
+			const useFlow = msg.flow && msg.flow.length > 0;
 			return html`
 				<div class="px-4 flex flex-col gap-3">
-					${msg.text ? html`<markdown-block .content=${msg.text}></markdown-block>` : ""}
+					${useFlow
+						? msg.flow!.map((block) => this.renderFlowBlock(block))
+						: html`
+							${msg.timeline && msg.timeline.length > 0
+								? html`<agent-activity-timeline
+										.steps=${msg.timeline}
+									></agent-activity-timeline>`
+								: ""}
+							${msg.text ? html`<markdown-block .content=${msg.text}></markdown-block>` : ""}
+						`}
 					${msg.thread ? this.renderThread(msg.thread) : ""}
 					${msg.files?.map((f) => this.renderFile(f))}
 				</div>
@@ -448,19 +620,36 @@ export class CoreServiceChatPanel extends LitElement {
 		`;
 	}
 
+	private renderFlowBlock(block: FlowBlock) {
+		if (block.type === "text") {
+			if (!block.text) return "";
+			return html`<markdown-block .content=${block.text}></markdown-block>`;
+		}
+		if (block.steps.length === 0) return "";
+		return html`<agent-activity-timeline .steps=${block.steps}></agent-activity-timeline>`;
+	}
+
 	private renderStreaming() {
-		const hasContent = this.streamingText || this.streamingThread || this.streamingFiles.length > 0;
+		const hasContent =
+			this.streamingFlow.length > 0 ||
+			this.streamingThread ||
+			this.streamingFiles.length > 0;
 
 		if (!hasContent) {
 			const label = this.streamingStatus || "thinking";
-			return html`<div class="px-4 text-sm text-muted-foreground italic animate-pulse">${label}...</div>`;
+			return html`<div class="px-4 text-sm text-muted-foreground italic animate-pulse">
+				${label}...
+			</div>`;
 		}
+		const hasSteps = this.streamingFlow.some((b) => b.type === "steps");
 		return html`
 			<div class="px-4 flex flex-col gap-3">
-				${this.streamingStatus
-					? html`<div class="text-xs text-muted-foreground italic">${this.streamingStatus}...</div>`
+				${this.streamingFlow.map((block) => this.renderFlowBlock(block))}
+				${this.streamingStatus && !hasSteps
+					? html`<div class="text-xs text-muted-foreground italic">
+							${this.streamingStatus}...
+						</div>`
 					: ""}
-				${this.streamingText ? html`<markdown-block .content=${this.streamingText}></markdown-block>` : ""}
 				${this.streamingThread ? this.renderThread(this.streamingThread) : ""}
 				${this.streamingFiles.map((f) => this.renderFile(f))}
 			</div>
