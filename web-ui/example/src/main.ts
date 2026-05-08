@@ -79,7 +79,7 @@ function renderApp() {
 							onClick: toggleSidebar,
 							title: sidebarOpen ? "Collapse sessions" : "Expand sessions",
 						})}
-						<span class="text-base font-semibold text-foreground">Bot Chat</span>
+						<span class="text-base font-semibold text-foreground">OctoAgent · ABAP Assistant</span>
 					</div>
 					<div class="flex items-center gap-1">
 						<theme-toggle></theme-toggle>

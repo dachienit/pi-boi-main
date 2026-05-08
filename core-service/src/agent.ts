@@ -1,5 +1,14 @@
 import { Agent, type AgentEvent } from "@mariozechner/pi-agent-core";
-import { getModel, type ImageContent } from "@mariozechner/pi-ai";
+import {
+	type AssistantMessage,
+	type AssistantMessageEventStream,
+	type Context,
+	createAssistantMessageEventStream,
+	getModel,
+	type ImageContent,
+	type Model,
+	type ToolCall,
+} from "@mariozechner/pi-ai";
 import {
 	AgentSession,
 	AuthStorage,
@@ -179,27 +188,139 @@ function loadMomSkills(channelDir: string, workspacePath: string): Skill[] {
 	return Array.from(skillMap.values());
 }
 
+// =============================================================================
+// LLM Farm Bypass: Synthetic streamFn that always dispatches to callDIABrain.
+// =============================================================================
+// We replace the default `streamSimple` (which fetches LLM Farm) with a
+// synthetic emitter. Pi-agent loop, sessionManager, logging, retry, abort
+// all still fire normally because we return a real AssistantMessageEventStream
+// emitting the standard "done" event. Zero HTTP, zero token cost on Nano.
+
+const ZERO_USAGE = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+// Matches the mom-bot prefix added in agent.ts ~line 855:
+//   `[${timestamp}] [${userName}]: ${text}`
+// We strip it here so DIA Brain receives the user's raw text only.
+const USER_PREFIX_RE = /^\[[^\]]+\]\s*\[[^\]]+\]:\s*/;
+
+function stripUserPrefix(text: string): string {
+	return text.replace(USER_PREFIX_RE, "");
+}
+
+function extractUserText(content: unknown): string {
+	let raw = "";
+	if (typeof content === "string") {
+		raw = content;
+	} else if (Array.isArray(content)) {
+		raw = content
+			.filter(
+				(c): c is { type: "text"; text: string } =>
+					typeof c === "object" && c !== null && (c as any).type === "text",
+			)
+			.map((c) => c.text)
+			.join("\n");
+	}
+	return stripUserPrefix(raw.trim()).trim();
+}
+
+function makeLabel(userText: string): string {
+	const stripped = userText.replace(/\s+/g, " ").trim();
+	const truncated = stripped.length > 45 ? `${stripped.slice(0, 45)}...` : stripped;
+	return `Ask DIA: ${truncated}`;
+}
+
+/**
+ * Synthetic streamFn that bypasses LLM Farm entirely.
+ *
+ * - Last message = user (with non-empty text) -> emit assistant{toolCall callDIABrain({query: verbatim, label})}
+ * - Last message = toolResult OR signal aborted OR empty user -> emit assistant{text:"", stopReason:stop|aborted}
+ *   so the agent loop terminates gracefully.
+ *
+ * After tool_execution_end fires session.abort() (existing short-circuit logic
+ * for callDIABrain), the next iter lands here with aborted=true and we return stop.
+ */
+function synthDiaStreamFn(
+	targetModel: Model<any>,
+	context: Context,
+	options?: { signal?: AbortSignal },
+): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	const lastMsg = context.messages[context.messages.length - 1];
+	const now = Date.now();
+	const aborted = options?.signal?.aborted === true;
+
+	const baseMessage = {
+		role: "assistant" as const,
+		api: targetModel.api,
+		provider: (targetModel as any).provider,
+		model: targetModel.id,
+		usage: { ...ZERO_USAGE },
+		timestamp: now,
+	};
+
+	let finalMessage: AssistantMessage;
+
+	if (!aborted && lastMsg?.role === "user") {
+		const userText = extractUserText(lastMsg.content);
+		if (!userText.trim()) {
+			finalMessage = {
+				...baseMessage,
+				content: [{ type: "text", text: "" }],
+				stopReason: "stop",
+			} as AssistantMessage;
+		} else {
+			const toolCallId = `synth_${now}_${Math.random().toString(36).slice(2, 10)}`;
+			const toolCall: ToolCall = {
+				type: "toolCall",
+				id: toolCallId,
+				name: "callDIABrain",
+				arguments: { query: userText, label: makeLabel(userText) },
+			};
+			finalMessage = {
+				...baseMessage,
+				content: [toolCall],
+				stopReason: "toolUse",
+			} as AssistantMessage;
+		}
+	} else {
+		finalMessage = {
+			...baseMessage,
+			content: [{ type: "text", text: "" }],
+			stopReason: aborted ? "aborted" : "stop",
+		} as AssistantMessage;
+	}
+
+	queueMicrotask(() => {
+		stream.push({
+			type: "done",
+			reason: aborted ? "aborted" : (finalMessage.stopReason as any),
+			message: finalMessage,
+		} as any);
+		stream.end(finalMessage);
+	});
+
+	return stream;
+}
+
 function buildSystemPrompt(
 	workspacePath: string,
 	channelId: string,
 	memory: string,
 	sandboxConfig: SandboxConfig,
-	channels: ChannelInfo[],
-	users: UserInfo[],
+	_channels: ChannelInfo[],
+	_users: UserInfo[],
 	skills: Skill[],
 ): string {
-	// Normalize to forward slashes for system prompt — Windows shells accept both
 	const workspacePathFwd = workspacePath.replace(/\\/g, "/");
 	const channelPath = `${workspacePathFwd}/sessions/${channelId}`;
 	const isDocker = sandboxConfig.type === "docker";
-
-	// Format channel mappings
-	const channelMappings =
-		channels.length > 0 ? channels.map((c) => `${c.id}\t#${c.name}`).join("\n") : "(no channels loaded)";
-
-	// Format user mappings
-	const userMappings =
-		users.length > 0 ? users.map((u) => `${u.id}\t@${u.userName}\t${u.displayName}`).join("\n") : "(no users loaded)";
 
 	const envDescription = isDocker
 		? `You are running inside a Docker container (Alpine Linux).
@@ -210,23 +331,39 @@ function buildSystemPrompt(
 - Bash working directory: ${process.cwd()}
 - Be careful with system modifications`;
 
-	return `You are mom, a Slack bot assistant. Be concise. No emojis.
+	return `You are OctoAgent's first-turn order taker for an ABAP IDE web tool (SAP S/4HANA + ABAP Cloud). You know the menu and the kitchens; you do NOT cook ABAP. Be concise, technical, direct. No emojis. No filler. Act first, explain briefly.
 
-## Context
-- For current date/time, use: date
-- You have access to previous conversation context including tool results from prior turns.
-- For older history beyond your context, search log.jsonl (contains user messages and your final responses, but not tool results).
+Two kitchens:
+- DIA Brain (Claude + Bosch SAP RAG): the only chef for SAP/ABAP/CDS/RAP/S-4HANA orders. Route via \`callDIABrain\`.
+- Local file tools (\`write\`, \`edit\`, \`read\`, \`attach\`, \`bash\`): for simple non-SAP deliverables you can handle yourself.
 
-## Slack Formatting (mrkdwn, NOT Markdown)
-Bold: *text*, Italic: _text_, Code: \`code\`, Block: \`\`\`code\`\`\`, Links: <url|text>
-Do NOT use **double asterisks** or [markdown](links).
+## Action Rules (highest priority — read first, every turn)
+The user request fits ONE of these patterns. Pick the matching workflow and execute the tool calls BEFORE writing any prose.
 
-## Slack IDs
-Channels: ${channelMappings}
+0. **SAP / ABAP routing (HIGHEST PRIORITY)** — any request involving SAP, ABAP, CDS, RAP, S/4HANA, ABAP Cloud, OData, BAdI, AMDP, BTP, ALV, BAPI, BDC, IDoc, HANA, or any Bosch internal SAP topic
+   - Call \`callDIABrain\` ONCE. Do not call any other tool in this turn.
+   - \`query\` MUST be the user's last message copied BYTE-FOR-BYTE. Keep the user's language as-is (do NOT translate). Keep typos. Keep lower-case lower-case. Do NOT paraphrase, polish, expand, summarize. **FORBIDDEN to add to query**: file names, class names (ZCL_*), table names (EKKO/MARA/...), field names, ABAP code, REPORT/CLASS/INTERFACE headers, package names, transport requests, scratch paths, the word "abap". DIA has RAG + chat history and decides ALL technical details itself.
+   - \`label\`: format \`Ask DIA: <verb phrase>\` (e.g. "Ask DIA: write simple program", "Ask DIA: refactor legacy SELECT", "Ask DIA: review CDS view"). Under 60 chars. No "DIABrain:" prefix.
+   - \`terminal\`: omit (default true). DIA's reply IS the answer; the agent loop short-circuits after the tool returns — you MUST NOT emit any follow-up text. Anything you say after \`callDIABrain\` will be discarded. Set \`terminal: false\` ONLY if you genuinely need additional tools after DIA (rare).
+   - Wrong vs right (memorize). User: \`write a simple program and save to file\`
+     - WRONG: \`callDIABrain({ query: "Write a simple ABAP program. Create file hello.abap containing REPORT z_hello. WRITE 'Hello'.", ... })\` ← fabricated file/REPORT/code. Bug.
+     - RIGHT: \`callDIABrain({ query: "write a simple program and save to file", label: "Ask DIA: write simple program" })\` ← verbatim relay.
+1. **"save / write / store / generate ... to a file"** (file is the deliverable, NON-SAP only)
+   - Call \`write\` → save file to \`${channelPath}/scratch/<name>.<ext>\` (\`.md\`, \`.json\`, \`.txt\`, \`.sh\`, …).
+   - Call \`attach\` with the same path so it previews in the chat.
+   - Then a 2-3 line confirmation in chat. Do NOT paste the full code in chat — the file IS the code.
+2. **HTML / SVG / diagram (visualization deliverable, NON-SAP only)**
+   - Call \`write\` → save to \`${workspacePathFwd}/artifacts/${channelId}/<name>.html\`.
+   - Call \`attach\` with that path.
+3. **Paste-only (NON-SAP review / refactor / fix / explain) — no save requested**
+   - Reply directly in chat with structured Markdown. No tool calls needed unless you must read another file first.
+4. **Multi-file search / list / batch op (NON-SAP only)**
+   - Use \`bash\` (\`grep -r\`, \`ls\`, \`find\`). Avoid \`bash\` for single-file read/write — use \`read\` / \`write\` / \`edit\`.
 
-Users: ${userMappings}
+If the request is ambiguous and SAP-related, default to pattern 0 (callDIABrain). If non-SAP and ambiguous, default to pattern 1 (write + attach). Never respond with a long code block when the user said "save" / "write to file".
 
-When mentioning users, use <@username> format (e.g., <@mario>).
+## Mission (restaurant identity)
+OctoAgent: ABAP IDE for generating, refactoring, reviewing, and fixing ABAP / CDS / RAP for SAP S/4HANA and ABAP Cloud. All actual SAP/ABAP work is delegated to DIA Brain.
 
 ## Environment
 ${envDescription}
@@ -234,164 +371,41 @@ ${envDescription}
 ## Workspace Layout
 ${workspacePathFwd}/
 ├── MEMORY.md                    # Global memory (all channels)
-├── SYSTEM.md                    # Environment config log
-├── skills/                      # Global CLI tools you create
-├── artifacts/${channelId}/      # HTML/JS/CSS files rendered as interactive canvas in chat
-└── sessions/${channelId}/       # This channel
-    ├── MEMORY.md                # Channel-specific memory
-    ├── log.jsonl                # Message history (no tool results)
+├── SYSTEM.md                    # Project decisions log
+├── skills/                      # Reusable ABAP/CDS snippets (SKILL.md + template files)
+├── artifacts/${channelId}/      # HTML/SVG/diagrams rendered as interactive canvas
+└── sessions/${channelId}/       # Current session
+    ├── MEMORY.md                # Session-specific memory
+    ├── log.jsonl                # Message history
     ├── attachments/             # User-shared files
-    ├── scratch/                 # Your working directory
-    └── skills/                  # Channel-specific tools
+    ├── scratch/                 # Generated ABAP/CDS files
+    └── skills/                  # Session-specific snippets
 
-## Artifacts (Interactive Canvas)
-**Rule: Any time you create an HTML, SVG, or visualization file, you MUST:**
-1. Write it to \`${workspacePathFwd}/artifacts/${channelId}/\` (not to scratch or anywhere else)
-2. Immediately call \`attach\` with that file path so the user sees it rendered inline as an interactive canvas
+## Tools (menu)
+Every tool call needs a \`label\` (short user-visible action description).
+- **callDIABrain**: ONLY chef for SAP/ABAP/CDS/RAP/S-4HANA orders. DIA plans + executes write/edit/attach steps internally. Args: \`query\` (relay user request VERBATIM), \`label\` (\`Ask DIA: ...\`), optional \`terminal\` (default true → DIA's reply goes straight to UI, agent loop ends; set false only if you must run more tools after).
+- **read**: read a file (offset/limit for large files). NON-SAP usage.
+- **write**: create / overwrite a file. Auto-creates parent dirs. NON-SAP only.
+- **edit**: surgical \`oldText → newText\` replacement on an existing file (oldText must be unique). NON-SAP only.
+- **attach**: render a file inline in the chat. ALWAYS pair with the write/edit that produced it.
+- **bash**: shell commands for multi-file search / batch ops only. NON-SAP only.
 
-\`\`\`bash
-mkdir -p ${workspacePathFwd}/artifacts/${channelId}
-\`\`\`
-
-Then use the write tool to create the file there, then call attach:
-- \`attach\` path: \`${workspacePathFwd}/artifacts/${channelId}/my-file.html\`
-- \`attach\` title: a short descriptive name like "Poem" or "Dashboard"
-
-Do NOT just tell the user the file path — always call \`attach\` so it renders in the chat.
-
-**HTML Best Practices (IMPORTANT for tool call reliability):**
-- Keep HTML files under 3000 characters when possible
-- Use single quotes for HTML attributes: \`class='container'\` instead of \`class="container"\`
-- Use external or \`<style>\` blocks for CSS instead of inline styles
-- Avoid special characters in content that might break JSON: escape backslashes, use HTML entities for quotes
-- If content is large, split into multiple files (HTML + separate CSS/JS files)
-
-## Skills (Custom CLI Tools)
-You can create reusable CLI tools for recurring tasks (email, APIs, data processing, etc.).
-
-### Creating Skills
-Store in \`${workspacePathFwd}/skills/<name>/\` (global) or \`${channelPath}/skills/<name>/\` (channel-specific).
-Each skill directory needs a \`SKILL.md\` with YAML frontmatter:
-
-\`\`\`markdown
----
-name: skill-name
-description: Short description of what this skill does
----
-
-# Skill Name
-
-Usage instructions, examples, etc.
-Scripts are in: {baseDir}/
-\`\`\`
-
-\`name\` and \`description\` are required. Use \`{baseDir}\` as placeholder for the skill's directory path.
-
-### Available Skills
-${skills.length > 0 ? formatSkillsForPrompt(skills) : "(no skills installed yet)"}
-
-## Events
-You can schedule events that wake you up at specific times or when external things happen. Events are JSON files in \`${workspacePathFwd}/events/\`.
-
-### Event Types
-
-**Immediate** - Triggers as soon as harness sees the file. Use in scripts/webhooks to signal external events.
-\`\`\`json
-{"type": "immediate", "channelId": "${channelId}", "text": "New GitHub issue opened"}
-\`\`\`
-
-**One-shot** - Triggers once at a specific time. Use for reminders.
-\`\`\`json
-{"type": "one-shot", "channelId": "${channelId}", "text": "Remind Mario about dentist", "at": "2025-12-15T09:00:00+01:00"}
-\`\`\`
-
-**Periodic** - Triggers on a cron schedule. Use for recurring tasks.
-\`\`\`json
-{"type": "periodic", "channelId": "${channelId}", "text": "Check inbox and summarize", "schedule": "0 9 * * 1-5", "timezone": "${Intl.DateTimeFormat().resolvedOptions().timeZone}"}
-\`\`\`
-
-### Cron Format
-\`minute hour day-of-month month day-of-week\`
-- \`0 9 * * *\` = daily at 9:00
-- \`0 9 * * 1-5\` = weekdays at 9:00
-- \`30 14 * * 1\` = Mondays at 14:30
-- \`0 0 1 * *\` = first of each month at midnight
-
-### Timezones
-All \`at\` timestamps must include offset (e.g., \`+01:00\`). Periodic events use IANA timezone names. The harness runs in ${Intl.DateTimeFormat().resolvedOptions().timeZone}. When users mention times without timezone, assume ${Intl.DateTimeFormat().resolvedOptions().timeZone}.
-
-### Creating Events
-Use unique filenames to avoid overwriting existing events. Include a timestamp or random suffix:
-\`\`\`bash
-cat > ${workspacePathFwd}/events/dentist-reminder-$(date +%s).json << 'EOF'
-{"type": "one-shot", "channelId": "${channelId}", "text": "Dentist tomorrow", "at": "2025-12-14T09:00:00+01:00"}
-EOF
-\`\`\`
-Or check if file exists first before creating.
-
-### Managing Events
-- List: \`ls ${workspacePathFwd}/events/\`
-- View: \`cat ${workspacePathFwd}/events/foo.json\`
-- Delete/cancel: \`rm ${workspacePathFwd}/events/foo.json\`
-
-### When Events Trigger
-You receive a message like:
-\`\`\`
-[EVENT:dentist-reminder.json:one-shot:2025-12-14T09:00:00+01:00] Dentist tomorrow
-\`\`\`
-Immediate and one-shot events auto-delete after triggering. Periodic events persist until you delete them.
-
-### Silent Completion
-For periodic events where there's nothing to report, respond with just \`[SILENT]\` (no other text). This deletes the status message and posts nothing to Slack. Use this to avoid spamming the channel when periodic checks find nothing actionable.
-
-### Debouncing
-When writing programs that create immediate events (email watchers, webhook handlers, etc.), always debounce. If 50 emails arrive in a minute, don't create 50 immediate events. Instead collect events over a window and create ONE immediate event summarizing what happened, or just signal "new activity, check inbox" rather than per-item events. Or simpler: use a periodic event to check for new items every N minutes instead of immediate events.
-
-### Limits
-Maximum 5 events can be queued. Don't create excessive immediate or periodic events.
-
-## Memory
-Write to MEMORY.md files to persist context across conversations.
-- Global (${workspacePathFwd}/MEMORY.md): skills, preferences, project info
-- Channel (${channelPath}/MEMORY.md): channel-specific decisions, ongoing work
-Update when you learn something important or when asked to remember something.
+## Memory & Decisions (order memory)
+- Global \`${workspacePathFwd}/MEMORY.md\`: project conventions, namespace, target stack (S/4HANA release, ABAP Cloud yes/no), user preferences.
+- Session \`${channelPath}/MEMORY.md\`: decisions for this task.
+- \`${workspacePathFwd}/SYSTEM.md\`: append architectural decisions (RAP managed vs unmanaged, package layout, external dependencies).
+Update when you learn a durable fact or are asked to remember.
+Use this memory ONLY to route or set context. Do NOT use it to enrich \`callDIABrain.query\`.
 
 ### Current Memory
 ${memory}
 
-## System Configuration Log
-Maintain ${workspacePathFwd}/SYSTEM.md to log all environment modifications:
-- Installed packages (apk add, npm install, pip install)
-- Environment variables set
-- Config files modified (~/.gitconfig, cron jobs, etc.)
-- Skill dependencies installed
+### Available Snippets
+${skills.length > 0 ? formatSkillsForPrompt(skills) : "(no snippets yet — create one when a pattern repeats)"}
 
-Update this file whenever you modify the environment. On fresh container, read it first to restore your setup.
-
-## Log Queries (for older history)
-Format: \`{"date":"...","ts":"...","user":"...","userName":"...","text":"...","isBot":false}\`
-The log contains user messages and your final responses (not tool calls/results).
-${isDocker ? "Install jq: apk add jq" : ""}
-
-\`\`\`bash
-# Recent messages
-tail -30 log.jsonl | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
-
-# Search for specific topic
-grep -i "topic" log.jsonl | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
-
-# Messages from specific user
-grep '"userName":"mario"' log.jsonl | tail -20 | jq -c '{date: .date[0:19], text}'
-\`\`\`
-
-## Tools
-- bash: Run shell commands (primary tool). Install packages as needed.
-- read: Read files
-- write: Create/overwrite files
-- edit: Surgical file edits
-- attach: Share files to Slack
-
-Each tool requires a "label" parameter (shown to user).
+## Context
+- For current date/time: \`date\`.
+- Older history: search \`${channelPath}/log.jsonl\`.
 `;
 }
 
@@ -483,8 +497,10 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	const hostWorkingDir = dirname(dirname(channelDir));
 	const workspacePath = executor.getWorkspacePath(hostWorkingDir);
 
-	// Create tools with host working directory for fs operations
-	const tools = createMomTools(executor, hostWorkingDir);
+	// Create tools with host working directory for fs operations.
+	// hostWorkingDir IS the workspace root (workspacerks/), so it doubles as hostWorkspacePath
+	// for skills/* lookup inside callDIABrain.
+	const tools = createMomTools(executor, hostWorkingDir, channelId, hostWorkingDir);
 
 	// Initial system prompt (will be updated each run with fresh memory/channels/users/skills)
 	const memory = getMemory(channelDir);
@@ -516,6 +532,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		},
 		convertToLlm,
 		getApiKey: async () => getLlmApiKey(authStorage),
+		streamFn: synthDiaStreamFn,
 	});
 
 	// Load existing messages
@@ -569,6 +586,8 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		},
 		stopReason: "stop",
 		errorMessage: undefined as string | undefined,
+		diaFinalDisplay: undefined as string | undefined,
+		diaShortCircuited: false,
 	};
 
 	// Subscribe to events ONCE
@@ -621,6 +640,30 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 			if (agentEvent.isError) {
 				queue.enqueue(() => ctx.respond(`_Error: ${truncate(resultStr, 200)}_`, false), "tool error");
+			}
+
+			// Short-circuit nano synthesis after callDIABrain when DIA already produced the
+			// final user-facing text. Surface DIA's `display` directly to the UI and abort the
+			// agent loop so nano never fires its 2nd LLM call (saves cost + latency, preserves
+			// DIA's full detail verbatim).
+			if (
+				agentEvent.toolName === "callDIABrain" &&
+				!agentEvent.isError &&
+				typeof agentEvent.result === "object" &&
+				agentEvent.result !== null &&
+				"details" in agentEvent.result
+			) {
+				const details = (agentEvent.result as { details?: { shortCircuit?: boolean; finalDiaDisplay?: string } })
+					.details;
+				if (details?.shortCircuit && details.finalDiaDisplay) {
+					const finalText = details.finalDiaDisplay;
+					runState.diaFinalDisplay = finalText;
+					runState.diaShortCircuited = true;
+					log.logResponse(logCtx, finalText);
+					queue.enqueueMessage(finalText, "main", "dia final response");
+					queue.enqueueMessage(finalText, "thread", "dia final thread", false);
+					session.abort();
+				}
 			}
 		} else if (event.type === "message_start") {
 			const agentEvent = event as AgentEvent & { type: "message_start" };
@@ -774,6 +817,8 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			};
 			runState.stopReason = "stop";
 			runState.errorMessage = undefined;
+			runState.diaFinalDisplay = undefined;
+			runState.diaShortCircuited = false;
 
 			// Create queue for this run
 			let queueChain = Promise.resolve();
@@ -860,13 +905,29 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			await queueChain;
 
 			// Handle error case - update main message and post error to thread
-			if (runState.stopReason === "error" && runState.errorMessage) {
+			// Skip the error path when DIA short-circuited (the agent loop ends with stopReason
+			// "aborted" by design — that is success, not failure).
+			if (runState.stopReason === "error" && runState.errorMessage && !runState.diaShortCircuited) {
 				try {
 					await ctx.replaceMessage("_Sorry, something went wrong_");
 					await ctx.respondInThread(`_Error: ${runState.errorMessage}_`);
 				} catch (err) {
 					const errMsg = err instanceof Error ? err.message : String(err);
 					log.logWarning("Failed to post error message", errMsg);
+				}
+			} else if (runState.diaShortCircuited && runState.diaFinalDisplay) {
+				// DIA short-circuit: use the cached final display, ignore lastAssistant
+				// (it is empty / aborted because we cancelled nano's 2nd LLM call).
+				const finalText: string = runState.diaFinalDisplay;
+				try {
+					const mainText =
+						finalText.length > SLACK_MAX_LENGTH
+							? `${finalText.substring(0, SLACK_MAX_LENGTH - 50)}\n\n_(see thread for full response)_`
+							: finalText;
+					await ctx.replaceMessage(mainText);
+				} catch (err) {
+					const errMsg = err instanceof Error ? err.message : String(err);
+					log.logWarning("Failed to replace message with DIA final display", errMsg);
 				}
 			} else {
 				// Final message update
