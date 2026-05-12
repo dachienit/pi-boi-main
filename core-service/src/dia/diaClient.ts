@@ -1,6 +1,30 @@
+import { existsSync, readFileSync } from "fs";
+import { join } from "path";
 import { Agent, fetch } from "undici";
+import type { SkillName } from "../types.js";
 
 export type DiaPhase = "oauth" | "history" | "fetch";
+
+const SKILL_FILENAME = "SKILL.md";
+
+/**
+ * Load a skill's SKILL.md persona text from `<workspaceDir>/skills/<skill>/SKILL.md`.
+ *
+ * The persona is sent to DIA Brain as `customMessageBehaviour`. It contains
+ * scope, style, and output rules — but NOT pi-boi internals (paths, tools,
+ * channel ids). DIA stays workspace-blind by design; pi-boi handles all
+ * filesystem resolution after DIA returns.
+ */
+export function loadSkillPersona(workspaceDir: string, skill: SkillName): string {
+	const skillPath = join(workspaceDir, "skills", skill, SKILL_FILENAME);
+	if (!existsSync(skillPath)) {
+		throw new Error(
+			`Skill '${skill}' not found at ${skillPath}. ` +
+				`Create the file or run the OctoAgent setup that seeds workspace skills.`,
+		);
+	}
+	return readFileSync(skillPath, "utf-8");
+}
 
 export interface DiaPhaseEvent {
 	phase: DiaPhase;
@@ -195,14 +219,22 @@ export async function chatWithDIA(args: ChatWithDIAArgs): Promise<ChatWithDIARes
 	const token = await getTokenCached(onPhase);
 	const chatHistoryId = await getOrCreateHistory(channelId, brainId, token, onPhase);
 
-	const body = {
+	// Body schema differs between the two DIA workflows:
+	//   RAG  -> Claude + Bosch SAP RAG (uses `useGptKnowledge` toggle)
+	//   PURE -> gpt-5-nano (no RAG, accepts `attachmentIds` for per-call uploads)
+	// Sending an unknown field to either workflow can trigger backend rejection,
+	// so build the body strictly per the documented schema for the active mode.
+	const baseBody = {
 		prompt,
 		customMessageBehaviour,
 		knowledgeBaseId: brainId,
 		chatHistoryId,
 		debugStepDetailsEnabled: true,
-		useGptKnowledge: true,
 	};
+	const body =
+		mode === "rag"
+			? { ...baseBody, useGptKnowledge: true }
+			: { ...baseBody, attachmentIds: [] as string[] };
 
 	onPhase?.({ phase: "fetch", stage: "start" });
 	const t0 = Date.now();

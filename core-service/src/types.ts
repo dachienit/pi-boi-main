@@ -158,3 +158,100 @@ export interface EventRouter {
 	/** Queue a synthetic event for processing. Returns false if the queue is full. */
 	enqueueEvent(event: BotEvent): boolean;
 }
+
+// ============================================================================
+// Skill catalog — DIA Brain skill endpoints
+// ============================================================================
+
+/**
+ * Phase 1 ships only the `assistant` skill. Other skill names are reserved for
+ * future phases — DIA SKILL.md persona files will be added without code changes.
+ */
+export type SkillName = "assistant" | "analysis" | "refactor" | "review" | "fix";
+
+export const ENABLED_SKILLS: readonly SkillName[] = ["assistant"] as const;
+
+// ============================================================================
+// Canonical field catalog — pi-boi auto-dispatcher contract for DIA JSON output
+// ============================================================================
+
+/**
+ * Canonical fields DIA may return. Pi-boi dispatcher scans these by name and
+ * runs the corresponding action. Unknown fields are logged + ignored (forward
+ * compat). DIA is workspace-blind: `file_name` is a basename only — pi-boi
+ * resolves it against the session scratch directory via pathResolver.
+ *
+ * Phase 1 enables: display, file_name+file_content, html_artifact+file_name?,
+ *                  error, next_hint
+ * Phase 2/3 deferred: edit, bash_cmd, attach_path
+ */
+export interface DiaCanonicalResponse {
+	/** Markdown text streamed to UI via typewriter. */
+	display?: string;
+	/** Simple basename (no path); pi-boi resolves to scratch/<channelId>/. */
+	file_name?: string;
+	/** Full file contents to write at resolved path. Requires file_name. */
+	file_content?: string;
+	/** Full HTML body for canvas artifact. Pi-boi writes to artifacts/<channelId>/. */
+	html_artifact?: string;
+	/** Error message to surface to user; stops further field dispatch. */
+	error?: string;
+	/** Informational hint for nano (read in tool result, not auto-executed). */
+	next_hint?: string;
+	/** Allow forward-compat unknown fields; dispatcher logs warning. */
+	[key: string]: unknown;
+}
+
+export type CanonicalActionKind =
+	| "display"
+	| "write_file"
+	| "write_artifact"
+	| "error"
+	| "next_hint";
+
+export interface CanonicalActionResult {
+	kind: CanonicalActionKind;
+	ok: boolean;
+	/** Resolved absolute path for write_file / write_artifact actions. */
+	path?: string;
+	error?: string;
+	summary?: string;
+}
+
+export interface CanonicalDispatchResult {
+	actions: CanonicalActionResult[];
+	/** True if any action failed (file write rejected, sanitize failed, etc.). */
+	hadError: boolean;
+	/** Mirror of DIA's display so callers can persist / re-stream on refresh. */
+	display?: string;
+	/** Mirror of next_hint surfaced back to nano. */
+	nextHint?: string;
+	/** Files written and auto-attached, for chat chip rendering. */
+	attachedFiles: Array<{ path: string; title?: string }>;
+	/** Field names DIA returned that the dispatcher did not recognise. */
+	unknownFields: string[];
+}
+
+// ============================================================================
+// MCP scaffold (Phase 3 — interface only, no concrete server wired)
+// ============================================================================
+
+/**
+ * Minimal MCP server descriptor for future integration. Phase 1 leaves the
+ * registry empty; later phases will wire concrete MCP transports + tool
+ * adapters into the agent loop alongside pi-boi raw tools.
+ */
+export interface MCPServer {
+	name: string;
+	transport: "stdio" | "sse" | "http";
+	command?: string;
+	args?: string[];
+	url?: string;
+	enabled: boolean;
+}
+
+export interface MCPRegistry {
+	servers: MCPServer[];
+	/** Phase 3: list discovered tools across enabled servers. */
+	listTools?: () => Promise<Array<{ serverName: string; name: string; description: string }>>;
+}

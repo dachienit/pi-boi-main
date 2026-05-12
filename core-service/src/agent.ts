@@ -1,14 +1,5 @@
 import { Agent, type AgentEvent } from "@mariozechner/pi-agent-core";
-import {
-	type AssistantMessage,
-	type AssistantMessageEventStream,
-	type Context,
-	createAssistantMessageEventStream,
-	getModel,
-	type ImageContent,
-	type Model,
-	type ToolCall,
-} from "@mariozechner/pi-ai";
+import { getModel, type ImageContent } from "@mariozechner/pi-ai";
 import {
 	AgentSession,
 	AuthStorage,
@@ -29,8 +20,9 @@ import { MomSettingsManager, syncLogToSessionManager } from "./context.js";
 import * as log from "./log.js";
 import { createExecutor, type SandboxConfig } from "./sandbox.js";
 import type { BotContext, ChannelInfo, UserInfo } from "./types.js";
+import { ENABLED_SKILLS } from "./types.js";
 import type { ChannelStore } from "./store.js";
-import { createMomTools, setUploadFunction } from "./tools/index.js";
+import { createMomTools, setUploadFunction, setDiaUploadFunction } from "./tools/index.js";
 import { clearDiaEmitters, setDiaEmitters } from "./tools/dia.js";
 
 // Model configuration via environment variables:
@@ -189,127 +181,6 @@ function loadMomSkills(channelDir: string, workspacePath: string): Skill[] {
 	return Array.from(skillMap.values());
 }
 
-// =============================================================================
-// LLM Farm Bypass: Synthetic streamFn that always dispatches to callDIABrain.
-// =============================================================================
-// We replace the default `streamSimple` (which fetches LLM Farm) with a
-// synthetic emitter. Pi-agent loop, sessionManager, logging, retry, abort
-// all still fire normally because we return a real AssistantMessageEventStream
-// emitting the standard "done" event. Zero HTTP, zero token cost on Nano.
-
-const ZERO_USAGE = {
-	input: 0,
-	output: 0,
-	cacheRead: 0,
-	cacheWrite: 0,
-	totalTokens: 0,
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-};
-
-// Matches the mom-bot prefix added in agent.ts ~line 855:
-//   `[${timestamp}] [${userName}]: ${text}`
-// We strip it here so DIA Brain receives the user's raw text only.
-const USER_PREFIX_RE = /^\[[^\]]+\]\s*\[[^\]]+\]:\s*/;
-
-function stripUserPrefix(text: string): string {
-	return text.replace(USER_PREFIX_RE, "");
-}
-
-function extractUserText(content: unknown): string {
-	let raw = "";
-	if (typeof content === "string") {
-		raw = content;
-	} else if (Array.isArray(content)) {
-		raw = content
-			.filter(
-				(c): c is { type: "text"; text: string } =>
-					typeof c === "object" && c !== null && (c as any).type === "text",
-			)
-			.map((c) => c.text)
-			.join("\n");
-	}
-	return stripUserPrefix(raw.trim()).trim();
-}
-
-function makeLabel(userText: string): string {
-	const stripped = userText.replace(/\s+/g, " ").trim();
-	const truncated = stripped.length > 45 ? `${stripped.slice(0, 45)}...` : stripped;
-	return `Ask DIA: ${truncated}`;
-}
-
-/**
- * Synthetic streamFn that bypasses LLM Farm entirely.
- *
- * - Last message = user (with non-empty text) -> emit assistant{toolCall callDIABrain({query: verbatim, label})}
- * - Last message = toolResult OR signal aborted OR empty user -> emit assistant{text:"", stopReason:stop|aborted}
- *   so the agent loop terminates gracefully.
- *
- * After tool_execution_end fires session.abort() (existing short-circuit logic
- * for callDIABrain), the next iter lands here with aborted=true and we return stop.
- */
-function synthDiaStreamFn(
-	targetModel: Model<any>,
-	context: Context,
-	options?: { signal?: AbortSignal },
-): AssistantMessageEventStream {
-	const stream = createAssistantMessageEventStream();
-	const lastMsg = context.messages[context.messages.length - 1];
-	const now = Date.now();
-	const aborted = options?.signal?.aborted === true;
-
-	const baseMessage = {
-		role: "assistant" as const,
-		api: targetModel.api,
-		provider: (targetModel as any).provider,
-		model: targetModel.id,
-		usage: { ...ZERO_USAGE },
-		timestamp: now,
-	};
-
-	let finalMessage: AssistantMessage;
-
-	if (!aborted && lastMsg?.role === "user") {
-		const userText = extractUserText(lastMsg.content);
-		if (!userText.trim()) {
-			finalMessage = {
-				...baseMessage,
-				content: [{ type: "text", text: "" }],
-				stopReason: "stop",
-			} as AssistantMessage;
-		} else {
-			const toolCallId = `synth_${now}_${Math.random().toString(36).slice(2, 10)}`;
-			const toolCall: ToolCall = {
-				type: "toolCall",
-				id: toolCallId,
-				name: "callDIABrain",
-				arguments: { query: userText, label: makeLabel(userText) },
-			};
-			finalMessage = {
-				...baseMessage,
-				content: [toolCall],
-				stopReason: "toolUse",
-			} as AssistantMessage;
-		}
-	} else {
-		finalMessage = {
-			...baseMessage,
-			content: [{ type: "text", text: "" }],
-			stopReason: aborted ? "aborted" : "stop",
-		} as AssistantMessage;
-	}
-
-	queueMicrotask(() => {
-		stream.push({
-			type: "done",
-			reason: aborted ? "aborted" : (finalMessage.stopReason as any),
-			message: finalMessage,
-		} as any);
-		stream.end(finalMessage);
-	});
-
-	return stream;
-}
-
 function buildSystemPrompt(
 	workspacePath: string,
 	channelId: string,
@@ -324,89 +195,127 @@ function buildSystemPrompt(
 	const isDocker = sandboxConfig.type === "docker";
 
 	const envDescription = isDocker
-		? `You are running inside a Docker container (Alpine Linux).
-- Bash working directory: / (use cd or absolute paths)
-- Install tools with: apk add <package>
-- Your changes persist across sessions`
-		: `You are running directly on the host machine.
-- Bash working directory: ${process.cwd()}
-- Be careful with system modifications`;
+		? `Running inside Docker (Alpine).
+- bash cwd: / (use cd or absolute paths).
+- Install tools with: apk add <package>.`
+		: `Running on the host machine.
+- bash cwd: ${process.cwd()}.`;
 
-	return `You are OctoAgent's first-turn order taker for an ABAP IDE web tool (SAP S/4HANA + ABAP Cloud). You know the menu and the kitchens; you do NOT cook ABAP. Be concise, technical, direct. No emojis. No filler. Act first, explain briefly.
+	const enabledSkillsList = ENABLED_SKILLS.join(", ");
 
-Two kitchens:
-- DIA Brain (Claude + Bosch SAP RAG): the only chef for SAP/ABAP/CDS/RAP/S-4HANA orders. Route via \`callDIABrain\`.
-- Local file tools (\`write\`, \`edit\`, \`read\`, \`attach\`, \`bash\`): for simple non-SAP deliverables you can handle yourself.
+	return `You are OctoAgent's ORCHESTRATOR for an ABAP IDE web tool (SAP S/4HANA + ABAP Cloud).
 
-## Action Rules (highest priority — read first, every turn)
-The user request fits ONE of these patterns. Pick the matching workflow and execute the tool calls BEFORE writing any prose.
+# Role (locked — read every turn)
 
-0. **SAP / ABAP routing (HIGHEST PRIORITY)** — any request involving SAP, ABAP, CDS, RAP, S/4HANA, ABAP Cloud, OData, BAdI, AMDP, BTP, ALV, BAPI, BDC, IDoc, HANA, or any Bosch internal SAP topic
-   - Call \`callDIABrain\` ONCE. Do not call any other tool in this turn.
-   - \`query\` MUST be the user's last message copied BYTE-FOR-BYTE. Keep the user's language as-is (do NOT translate). Keep typos. Keep lower-case lower-case. Do NOT paraphrase, polish, expand, summarize. **FORBIDDEN to add to query**: file names, class names (ZCL_*), table names (EKKO/MARA/...), field names, ABAP code, REPORT/CLASS/INTERFACE headers, package names, transport requests, scratch paths, the word "abap". DIA has RAG + chat history and decides ALL technical details itself.
-   - \`label\`: format \`Ask DIA: <verb phrase>\` (e.g. "Ask DIA: write simple program", "Ask DIA: refactor legacy SELECT", "Ask DIA: review CDS view"). Under 60 chars. No "DIABrain:" prefix.
-   - \`terminal\`: omit (default true). DIA's reply IS the answer; the agent loop short-circuits after the tool returns — you MUST NOT emit any follow-up text. Anything you say after \`callDIABrain\` will be discarded. Set \`terminal: false\` ONLY if you genuinely need additional tools after DIA (rare).
-   - Wrong vs right (memorize). User: \`write a simple program and save to file\`
-     - WRONG: \`callDIABrain({ query: "Write a simple ABAP program. Create file hello.abap containing REPORT z_hello. WRITE 'Hello'.", ... })\` ← fabricated file/REPORT/code. Bug.
-     - RIGHT: \`callDIABrain({ query: "write a simple program and save to file", label: "Ask DIA: write simple program" })\` ← verbatim relay.
-1. **"save / write / store / generate ... to a file"** (file is the deliverable, NON-SAP only)
-   - Call \`write\` → save file to \`${channelPath}/scratch/<name>.<ext>\` (\`.md\`, \`.json\`, \`.txt\`, \`.sh\`, …).
-   - Call \`attach\` with the same path so it previews in the chat.
-   - Then a 2-3 line confirmation in chat. Do NOT paste the full code in chat — the file IS the code.
-2. **HTML / SVG / diagram (visualization deliverable, NON-SAP only)**
-   - Call \`write\` → save to \`${workspacePathFwd}/artifacts/${channelId}/<name>.html\`.
-   - Call \`attach\` with that path.
-3. **Paste-only (NON-SAP review / refactor / fix / explain) — no save requested**
-   - Reply directly in chat with structured Markdown. No tool calls needed unless you must read another file first.
-4. **Multi-file search / list / batch op (NON-SAP only)**
-   - Use \`bash\` (\`grep -r\`, \`ls\`, \`find\`). Avoid \`bash\` for single-file read/write — use \`read\` / \`write\` / \`edit\`.
+You ARE NOT a writer. You are a router.
 
-If the request is ambiguous and SAP-related, default to pattern 0 (callDIABrain). If non-SAP and ambiguous, default to pattern 1 (write + attach). Never respond with a long code block when the user said "save" / "write to file".
+- You NEVER produce free text for the user. Every assistant turn MUST be a \`toolCall\` or a \`stop\`. Never both. Never plain text.
+- All user-facing content (explanations, ABAP code, summaries, file content) comes from DIA Brain via \`callDIABrain\` OR from a tool result chip. Pi-boi auto-streams DIA's \`display\` field to the UI as a typewriter — you do not need to repeat it, paraphrase it, or comment on it.
+- If you emit free text, OctoAgent will silently DROP it (never shown to the user) and count a violation. Repeated violations downgrade the run.
+- After a \`callDIABrain\` result returns, you have ONE job: decide whether more tools are needed. If not, emit \`stop\`. Do not summarise, do not say "done", do not greet, do not apologise.
 
-## Mission (restaurant identity)
-OctoAgent: ABAP IDE for generating, refactoring, reviewing, and fixing ABAP / CDS / RAP for SAP S/4HANA and ABAP Cloud. All actual SAP/ABAP work is delegated to DIA Brain.
+# Available skills (DIA Brain endpoints)
 
-## Environment
+Phase 1 enabled: ${enabledSkillsList}.
+
+- **assistant** — generate / explain / quick-refactor ABAP, CDS, RAP, S/4HANA, ABAP Cloud, OData, BAdI, AMDP, BAPI, BDC, IDoc, HANA, BTP. Default for any SAP/ABAP request.
+
+DIA Brain is workspace-blind. It does NOT know about pi-boi, file paths, channel ids, scratch directories, or any tool. It only sees: (a) the skill persona text (loaded by pi-boi), and (b) the \`prompt\` you send, plus its own per-session chat history.
+
+# How to compose \`prompt\` for callDIABrain
+
+Format:
+\`\`\`
+<1-2 sentence intent in the user's language>
+
+Return ONLY this JSON:
+{ "<field>": "<type>", ... }
+\`\`\`
+
+Rules:
+1. **Never re-paste prior context.** DIA already has its per-session chat history. Follow-up turns: just send the new instruction (e.g. "now refactor the class you just produced and save to file"). DIA will remember the previous turn.
+2. **Never mention paths, scratch, channel ids, pi-boi, tools, or file system structure.** DIA is workspace-blind.
+3. **Never invent technical details** the user did not provide (no fake table names, no class names like ZCL_*, no REPORT headers, no field lists). Relay the user's intent verbatim or in 1-2 short sentences.
+4. **Always embed the JSON schema** you want DIA to return. Pick the smallest schema that captures the deliverable.
+5. **For file outputs**, ask DIA for a simple \`file_name\` basename only (e.g. \`zcl_po_reader.clas.abap\`), NOT a path. Pi-boi resolves it to the session scratch directory.
+
+# Canonical field catalog (what DIA returns → what pi-boi does)
+
+DIA returns a single JSON object. Pi-boi auto-dispatches each known field. You do not need to issue \`write\` / \`attach\` after a DIA call — pi-boi does that for you when the right fields are present.
+
+| Field | When to ask DIA for it | Pi-boi action |
+|-------|------------------------|---------------|
+| \`display\` | Any user-facing answer (explanation, summary, narrative). Use markdown. | Typewriter-stream to chat UI. |
+| \`file_name\` + \`file_content\` | User asked to save / write / store / generate a file (ABAP source, CDS source, .md, .txt). | Resolve basename to \`${channelPath}/scratch/<basename>\`, write file, auto-attach as chat chip. |
+| \`html_artifact\` (+ optional \`file_name\`) | User asked for an HTML / SVG / diagram artifact (visualization). | Resolve to \`${workspacePathFwd}/artifacts/${channelId}/<basename>\`, write, auto-attach as canvas. |
+| \`error\` | DIA cannot fulfil the request and wants to surface a clear error. | Surface error in UI; skip other fields. |
+| \`next_hint\` | DIA wants to suggest the next user action (informational only). | Bubble back to you in the tool result so you can plan a follow-up call (rarely needed). |
+
+Other fields (e.g. \`edit\`, \`bash_cmd\`, \`attach_path\`) are RESERVED for later phases and currently ignored.
+
+## Schema templates (copy and adapt)
+
+- Plain explanation / answer:
+  \`{ "display": "<markdown text>" }\`
+- Generate ABAP and save to file:
+  \`{ "display": "<short summary>", "file_name": "<basename>.abap", "file_content": "<full ABAP source>" }\`
+- Visualization artifact:
+  \`{ "display": "<short summary>", "html_artifact": "<full HTML>", "file_name": "<basename>.html" }\`
+- Cannot fulfil:
+  \`{ "error": "<reason>" }\`
+
+## Right vs wrong examples
+
+User: \`hello\`
+- RIGHT: \`callDIABrain({skill:"assistant", label:"Ask DIA: greet", prompt:"hello\\n\\nReturn ONLY: {\\"display\\":\\"<markdown text>\\"}"})\`
+- WRONG: emit text \`Hi! How can I help?\` ← banned (free text).
+
+User: \`viết 1 abap class select PO data và lưu vào file\`
+- RIGHT: \`callDIABrain({skill:"assistant", label:"Ask DIA: write PO reader class", prompt:"Generate an ABAP class that selects PO data and save it to a file (mirror the user's language: Vietnamese).\\n\\nReturn ONLY: {\\"display\\":\\"<short Vietnamese summary>\\",\\"file_name\\":\\"<basename>.clas.abap\\",\\"file_content\\":\\"<full ABAP source>\\"}"})\`
+- WRONG: \`callDIABrain({skill:"assistant", prompt:"Write an ABAP class ZCL_PO_READER selecting from EKKO..."})\` ← fabricated class/table names. Bug.
+- WRONG: emit text containing the ABAP source ← banned (free text + duplicates DIA's job).
+
+User: \`now refactor it\` (after the previous turn produced an ABAP class)
+- RIGHT: \`callDIABrain({skill:"assistant", label:"Ask DIA: refactor", prompt:"Refactor the class from the previous turn and save the new version to a file.\\n\\nReturn ONLY: {\\"display\\":\\"<short summary of changes>\\",\\"file_name\\":\\"<basename>.clas.abap\\",\\"file_content\\":\\"<full refactored ABAP source>\\"}"})\`
+- WRONG: re-pasting the previous ABAP code into \`prompt\` ← DIA already has it in history.
+
+# Local pi-boi tools (NON-SAP only — rare)
+
+Use these only when the user explicitly works with non-SAP files already on disk. SAP/ABAP work always goes through DIA.
+
+- \`read({path,offset?,limit?,label})\` — read a file the user just attached (e.g. to feed it into the next \`callDIABrain.prompt\`). Common case: user attached a file and wants ABAP analysis → \`read\` first, then \`callDIABrain({prompt:"analyse this:\\n<content>", ...})\`.
+- \`write({path,content,label})\` — write a non-SAP file (e.g. \`.md\` notes).
+- \`edit({path,oldText,newText,label})\` — surgical replace on an existing non-SAP file.
+- \`attach({path,title?,label})\` — surface a file as a chat chip (only needed for non-SAP files; DIA outputs are auto-attached).
+- \`bash({command,label})\` — multi-file search / list (rare).
+
+Every tool call needs a \`label\` (\`Ask DIA: ...\` for callDIABrain; brief verb phrase for the rest).
+
+# Termination
+
+After every \`callDIABrain\` result:
+- If the result indicates DIA already produced \`display\` and any requested files were written, AND the user's intent is satisfied → emit \`stop\`. Do not add text.
+- If you genuinely need more (e.g. user asked "read foo.txt and refactor", and you only have the file content but not the refactor yet) → call the next tool.
+
+# Environment
 ${envDescription}
 
-## Workspace Layout
+# Workspace layout (for your routing decisions only — never mention to DIA)
 ${workspacePathFwd}/
-├── MEMORY.md                    # Global memory (all channels)
-├── SYSTEM.md                    # Project decisions log
-├── skills/                      # Reusable ABAP/CDS snippets (SKILL.md + template files)
-├── artifacts/${channelId}/      # HTML/SVG/diagrams rendered as interactive canvas
-└── sessions/${channelId}/       # Current session
-    ├── MEMORY.md                # Session-specific memory
+├── MEMORY.md                    # Global memory
+├── skills/                      # SKILL.md persona files for DIA endpoints
+├── artifacts/${channelId}/      # HTML / SVG / diagrams (canvas)
+└── sessions/${channelId}/
+    ├── MEMORY.md                # Session memory
     ├── log.jsonl                # Message history
     ├── attachments/             # User-shared files
-    ├── scratch/                 # Generated ABAP/CDS files
-    └── skills/                  # Session-specific snippets
+    └── scratch/                 # Generated SAP / non-SAP files
 
-## Tools (menu)
-Every tool call needs a \`label\` (short user-visible action description).
-- **callDIABrain**: ONLY chef for SAP/ABAP/CDS/RAP/S-4HANA orders. DIA plans + executes write/edit/attach steps internally. Args: \`query\` (relay user request VERBATIM), \`label\` (\`Ask DIA: ...\`), optional \`terminal\` (default true → DIA's reply goes straight to UI, agent loop ends; set false only if you must run more tools after).
-- **read**: read a file (offset/limit for large files). NON-SAP usage.
-- **write**: create / overwrite a file. Auto-creates parent dirs. NON-SAP only.
-- **edit**: surgical \`oldText → newText\` replacement on an existing file (oldText must be unique). NON-SAP only.
-- **attach**: render a file inline in the chat. ALWAYS pair with the write/edit that produced it.
-- **bash**: shell commands for multi-file search / batch ops only. NON-SAP only.
-
-## Memory & Decisions (order memory)
-- Global \`${workspacePathFwd}/MEMORY.md\`: project conventions, namespace, target stack (S/4HANA release, ABAP Cloud yes/no), user preferences.
-- Session \`${channelPath}/MEMORY.md\`: decisions for this task.
-- \`${workspacePathFwd}/SYSTEM.md\`: append architectural decisions (RAP managed vs unmanaged, package layout, external dependencies).
-Update when you learn a durable fact or are asked to remember.
-Use this memory ONLY to route or set context. Do NOT use it to enrich \`callDIABrain.query\`.
-
-### Current Memory
+## Memory (use only to route — never re-send to DIA)
 ${memory}
 
-### Available Snippets
-${skills.length > 0 ? formatSkillsForPrompt(skills) : "(no snippets yet — create one when a pattern repeats)"}
-
-## Context
-- For current date/time: \`date\`.
-- Older history: search \`${channelPath}/log.jsonl\`.
+## Skill snippets (for your awareness)
+${skills.length > 0 ? formatSkillsForPrompt(skills) : "(no snippets yet)"}
 `;
 }
 
@@ -523,7 +432,11 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	}
 	const modelRegistry = new ModelRegistry(authStorage);
 
-	// Create agent
+	// Create agent. NOTE: no `streamFn` override — pi-agent-core's default
+	// `streamSimple` is used so each agent-loop turn fires a real LLM Farm
+	// (gpt-5-nano via LLM_BASE_URL) request. Nano is the orchestrator at every
+	// nhịp; the text-content guardrail in our subscriber ensures it never
+	// surfaces free text to the user.
 	const agent = new Agent({
 		initialState: {
 			systemPrompt,
@@ -533,7 +446,6 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		},
 		convertToLlm,
 		getApiKey: async () => getLlmApiKey(authStorage),
-		streamFn: synthDiaStreamFn,
 	});
 
 	// Load existing messages
@@ -587,12 +499,24 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		},
 		stopReason: "stop",
 		errorMessage: undefined as string | undefined,
-		diaFinalDisplay: undefined as string | undefined,
-		diaShortCircuited: false,
-		// True when DIA's display text was streamed inline via emitDelta (typewriter).
-		// Suppresses the trailing replaceMessage so we don't push a duplicate text
-		// block AFTER the tool cards in the activity flow.
+		// Guardrail: count nano turns that emitted free text instead of a toolCall.
+		// Each violation drops the text from the UI silently — pi-boi NEVER lets
+		// nano's text reach the user. We only count for diagnostics.
+		nanoTextViolations: 0,
+		// True after at least one DIA call has been made in this run. Used by the
+		// post-run fallback: if nano never called DIA AND emitted text, we
+		// synthetically dispatch one callDIABrain on the user's behalf.
+		diaCallsMade: 0,
+		// True when DIA already typewrote its display field inline. Suppresses
+		// the trailing replaceMessage so we don't push a duplicate text block
+		// after the tool chips in the activity flow.
 		diaStreamedInline: false,
+		// Cached most-recent DIA display so the post-run path can replaceMessage
+		// when the inline typewriter did NOT run (e.g. SSE adapter without
+		// emitDelta wired).
+		lastDiaDisplay: undefined as string | undefined,
+		// Stash of the user's text for this run, used by the synthetic fallback.
+		userText: "",
 	};
 
 	// Subscribe to events ONCE
@@ -612,6 +536,10 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				args: agentEvent.args,
 				startTime: Date.now(),
 			});
+
+			if (agentEvent.toolName === "callDIABrain") {
+				runState.diaCallsMade += 1;
+			}
 
 			log.logToolStart(logCtx, agentEvent.toolName, label, agentEvent.args as Record<string, unknown>);
 			queue.enqueue(() => ctx.respond(`_→ ${label}_`, false), "tool label");
@@ -647,10 +575,8 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				queue.enqueue(() => ctx.respond(`_Error: ${truncate(resultStr, 200)}_`, false), "tool error");
 			}
 
-			// Short-circuit nano synthesis after callDIABrain when DIA already produced the
-			// final user-facing text. Surface DIA's `display` directly to the UI and abort the
-			// agent loop so nano never fires its 2nd LLM call (saves cost + latency, preserves
-			// DIA's full detail verbatim).
+			// Cache the most-recent DIA display so the post-run path can replace
+			// the main message bubble for adapters that lack inline streaming.
 			if (
 				agentEvent.toolName === "callDIABrain" &&
 				!agentEvent.isError &&
@@ -660,24 +586,13 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			) {
 				const details = (
 					agentEvent.result as {
-						details?: { shortCircuit?: boolean; finalDiaDisplay?: string; streamedInline?: boolean };
+						details?: { display?: string; streamedInline?: boolean };
 					}
 				).details;
-				if (details?.shortCircuit && details.finalDiaDisplay) {
-					const finalText = details.finalDiaDisplay;
-					runState.diaFinalDisplay = finalText;
-					runState.diaShortCircuited = true;
-					runState.diaStreamedInline = Boolean(details.streamedInline);
-					log.logResponse(logCtx, finalText);
-					// When DIA already streamed text inline via emitDelta, the user has seen
-					// the full response token-by-token. Skip the duplicate enqueueMessage to
-					// avoid posting the same text twice — the trailing replaceMessage at the
-					// end of run() is also suppressed (see runState.diaStreamedInline check).
-					if (!details.streamedInline) {
-						queue.enqueueMessage(finalText, "main", "dia final response");
-					}
-					queue.enqueueMessage(finalText, "thread", "dia final thread", false);
-					session.abort();
+				if (details?.display) {
+					runState.lastDiaDisplay = details.display;
+					if (details.streamedInline) runState.diaStreamedInline = true;
+					log.logResponse(logCtx, details.display);
 				}
 			}
 		} else if (event.type === "message_start") {
@@ -712,15 +627,18 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				const content = agentEvent.message.content;
 				const thinkingParts: string[] = [];
 				const textParts: string[] = [];
+				let hasToolCall = false;
 				for (const part of content) {
 					if (part.type === "thinking") {
 						thinkingParts.push((part as any).thinking);
 					} else if (part.type === "text") {
 						textParts.push((part as any).text);
+					} else if (part.type === "toolCall") {
+						hasToolCall = true;
 					}
 				}
 
-				const text = textParts.join("\n");
+				const text = textParts.join("\n").trim();
 
 				for (const thinking of thinkingParts) {
 					log.logThinking(logCtx, thinking);
@@ -728,10 +646,40 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 					queue.enqueueMessage(`_${thinking}_`, "thread", "thinking thread", false);
 				}
 
-				if (text.trim()) {
-					log.logResponse(logCtx, text);
-					queue.enqueueMessage(text, "main", "response main");
-					queue.enqueueMessage(text, "thread", "response thread", false);
+				// === GUARDRAIL: drop nano free text ===
+				// Nano is a pure orchestrator. Every assistant turn must be a
+				// toolCall or a stop. If text leaks through (with or without a
+				// toolCall), we DROP it from the UI and increment the violation
+				// counter for diagnostics. The thread still gets the text so we
+				// can audit the violation post-hoc.
+				if (text) {
+					if (hasToolCall) {
+						// Hybrid: text + toolCall. Drop the text only.
+						runState.nanoTextViolations += 1;
+						log.logWarning(
+							"nano guardrail",
+							`dropped text alongside toolCall (violation #${runState.nanoTextViolations}): ${truncate(text, 120)}`,
+						);
+						queue.enqueueMessage(
+							`_(dropped nano text — violation #${runState.nanoTextViolations})_\n${text}`,
+							"thread",
+							"dropped nano text audit",
+							false,
+						);
+					} else {
+						// Text-only turn. Drop from UI; let stop fire naturally.
+						runState.nanoTextViolations += 1;
+						log.logWarning(
+							"nano guardrail",
+							`dropped text-only turn (violation #${runState.nanoTextViolations}): ${truncate(text, 120)}`,
+						);
+						queue.enqueueMessage(
+							`_(dropped nano text — violation #${runState.nanoTextViolations})_\n${text}`,
+							"thread",
+							"dropped nano text audit",
+							false,
+						);
+					}
 				}
 			}
 		} else if (event.type === "auto_compaction_start") {
@@ -809,11 +757,15 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			);
 			session.agent.setSystemPrompt(systemPrompt);
 
-			// Set up file upload function
-			setUploadFunction(async (filePath: string, title?: string) => {
+			// Set up file upload function (used by the legacy `attach` tool).
+			const uploadFn = async (filePath: string, title?: string) => {
 				const hostPath = translateToHostPath(filePath, channelDir, workspacePath, channelId);
 				await ctx.uploadFile(hostPath, title);
-			});
+			};
+			setUploadFunction(uploadFn);
+			// Same upload pipeline reused by the canonical dispatcher inside
+			// callDIABrain (write_file / write_artifact actions).
+			setDiaUploadFunction(uploadFn);
 
 			// Wire DIA streaming emitters → SSE (per-run, cleared in finally below).
 			// Adapter (HTTP) provides emit* methods; Slack adapter omits them so DIA
@@ -844,9 +796,11 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			};
 			runState.stopReason = "stop";
 			runState.errorMessage = undefined;
-			runState.diaFinalDisplay = undefined;
-			runState.diaShortCircuited = false;
+			runState.nanoTextViolations = 0;
+			runState.diaCallsMade = 0;
 			runState.diaStreamedInline = false;
+			runState.lastDiaDisplay = undefined;
+			runState.userText = ctx.message.text;
 
 			// Create queue for this run
 			let queueChain = Promise.resolve();
@@ -932,10 +886,44 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			// Wait for queued messages
 			await queueChain;
 
-			// Handle error case - update main message and post error to thread
-			// Skip the error path when DIA short-circuited (the agent loop ends with stopReason
-			// "aborted" by design — that is success, not failure).
-			if (runState.stopReason === "error" && runState.errorMessage && !runState.diaShortCircuited) {
+			// === GUARDRAIL FALLBACK ===
+			// If nano emitted free text but never invoked any DIA call, dispatch
+			// one synthetic callDIABrain on the user's behalf so they don't end
+			// up with a blank UI. (Run AFTER session.prompt() returns so we don't
+			// re-enter the agent loop while it's still active.)
+			if (
+				runState.nanoTextViolations > 0 &&
+				runState.diaCallsMade === 0 &&
+				runState.userText.trim() &&
+				runState.stopReason !== "error"
+			) {
+				log.logWarning(
+					"nano guardrail",
+					`fallback: nano emitted ${runState.nanoTextViolations} text turn(s) without a DIA call — dispatching synthetic callDIABrain`,
+				);
+				const fallbackPrompt =
+					`${runState.userText.trim()}\n\nReturn ONLY: {"display":"<markdown text>"}`;
+				const fallbackTool = tools.find((t) => t.name === "callDIABrain");
+				if (fallbackTool) {
+					try {
+						await fallbackTool.execute(
+							`fallback_${Date.now()}`,
+							{
+								skill: "assistant",
+								label: "Ask DIA: fallback",
+								prompt: fallbackPrompt,
+							} as never,
+							undefined,
+						);
+					} catch (err) {
+						const errMsg = err instanceof Error ? err.message : String(err);
+						log.logWarning("synthetic callDIABrain fallback failed", errMsg);
+					}
+				}
+			}
+
+			// Handle error case - update main message and post error to thread.
+			if (runState.stopReason === "error" && runState.errorMessage) {
 				try {
 					await ctx.replaceMessage("_Sorry, something went wrong_");
 					await ctx.respondInThread(`_Error: ${runState.errorMessage}_`);
@@ -943,19 +931,15 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 					const errMsg = err instanceof Error ? err.message : String(err);
 					log.logWarning("Failed to post error message", errMsg);
 				}
-			} else if (runState.diaShortCircuited && runState.diaFinalDisplay) {
-				// DIA short-circuit: use the cached final display, ignore lastAssistant
-				// (it is empty / aborted because we cancelled nano's 2nd LLM call).
-				//
-				// When DIA already typewrote the text inline (the new flow), the user
-				// has the full response visible IN POSITION (between iter card and tool
-				// cards). Calling replaceMessage now would push a duplicate text block
-				// at the END of the flow — visually a "pop" of duplicate text after
-				// the tool cards. So skip it; the inline-streamed text is canonical.
+			} else if (runState.diaCallsMade > 0 && runState.lastDiaDisplay) {
+				// DIA wrote display via the typewriter (when emitDelta wired). No
+				// extra replaceMessage in that case — the inline-streamed text is
+				// canonical. Otherwise (Slack adapter or no streaming) push the
+				// cached display to the main bubble.
 				if (runState.diaStreamedInline) {
-					log.logInfo("DIA: text already streamed inline via typewriter, skipping replaceMessage");
+					log.logInfo("DIA: display already streamed inline; skipping replaceMessage");
 				} else {
-					const finalText: string = runState.diaFinalDisplay;
+					const finalText: string = runState.lastDiaDisplay;
 					try {
 						const mainText =
 							finalText.length > SLACK_MAX_LENGTH
@@ -964,11 +948,14 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 						await ctx.replaceMessage(mainText);
 					} catch (err) {
 						const errMsg = err instanceof Error ? err.message : String(err);
-						log.logWarning("Failed to replace message with DIA final display", errMsg);
+						log.logWarning("Failed to replace message with DIA display", errMsg);
 					}
 				}
 			} else {
-				// Final message update
+				// No DIA call (and no error) — usually means nano correctly emitted
+				// a stop on a non-actionable turn. Surface only the [SILENT] marker
+				// from the most recent assistant text (if any) — all real text was
+				// already dropped by the guardrail.
 				const messages = session.messages;
 				const lastAssistant = messages.filter((m) => m.role === "assistant").pop();
 				const finalText =
@@ -977,7 +964,6 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 						.map((c) => c.text)
 						.join("\n") || "";
 
-				// Check for [SILENT] marker - delete message and thread instead of posting
 				if (finalText.trim() === "[SILENT]" || finalText.trim().startsWith("[SILENT]")) {
 					try {
 						await ctx.deleteMessage();
@@ -986,7 +972,9 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 						const errMsg = err instanceof Error ? err.message : String(err);
 						log.logWarning("Failed to delete message for silent response", errMsg);
 					}
-				} else if (finalText.trim()) {
+				} else if (finalText.trim() && runState.nanoTextViolations === 0) {
+					// Defensive: surface text only if it was NOT dropped by the
+					// guardrail (i.e. nanoTextViolations counter unchanged).
 					try {
 						const mainText =
 							finalText.length > SLACK_MAX_LENGTH
@@ -1027,6 +1015,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			runState.logCtx = null;
 			runState.queue = null;
 			clearDiaEmitters();
+			setDiaUploadFunction(null);
 
 			return { stopReason: runState.stopReason, errorMessage: runState.errorMessage };
 		},

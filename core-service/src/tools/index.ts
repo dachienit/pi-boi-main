@@ -1,4 +1,5 @@
 import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { MCPRegistry } from "../types.js";
 import type { Executor } from "../sandbox.js";
 import { createAttachTool } from "./attach.js";
 import { createBashTool } from "./bash.js";
@@ -8,6 +9,19 @@ import { createReadTool } from "./read.js";
 import { createWriteTool } from "./write.js";
 
 export { setUploadFunction } from "./attach.js";
+export { setDiaUploadFunction } from "./dia.js";
+
+/**
+ * MCP registry — Phase 1 returns an empty registry. Phase 3 will wire concrete
+ * MCP servers (stdio / sse / http transports) and merge their tools into the
+ * agent loop's tool catalog alongside pi-boi raw tools.
+ */
+export function createMCPRegistry(): MCPRegistry {
+	return {
+		servers: [],
+		listTools: async () => [],
+	};
+}
 
 /**
  * Create OctoAgent tools with working directory context.

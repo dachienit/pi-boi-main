@@ -392,21 +392,17 @@ export class HttpServer {
 			flow?: FlowBlock[];
 		};
 
-		// Rebuild interleaved FlowBlock[] from the persisted details.timeline payload
-		// of a callDIABrain toolResult. Stable IDs are derived from the parent
-		// toolCallId + iteration / phase / tool index so re-renders don't churn.
+		// Rebuild interleaved FlowBlock[] from a persisted callDIABrain toolResult.
 		//
-		// Per iteration:
-		//   - if `displayText` is present (new sessions): emit
-		//       { steps: [iter + phases] }, { text: displayText }, { steps: [tool] }*
-		//     so each tool becomes its own top-level card AFTER the text.
-		//   - else (legacy sessions, pre-Phase 8.5): emit one nested
-		//       { steps: [iter + phases + tools-with-parentId] } block so the
-		//       layout matches the old monolithic timeline card.
+		// New schema (Phase 1 — single-shot DIA call per tool invocation):
+		//   details.timeline = [PersistedDiaCall] (always length 1)
+		//   PersistedDiaCall = { skill, label, durationMs, status, phases[], pipeline?,
+		//                         ragSources?, llmMeta?, actions[], displayText?, ... }
+		//   actions = [{ kind: "display"|"write_file"|"write_artifact"|... , label, status, summary? }]
 		//
-		// When NO iteration carried `displayText` and `finalDiaDisplay` exists, it
-		// is appended as a trailing { text } block so legacy sessions still show
-		// the assistant's response below the activity card.
+		// Legacy schema (pre-refactor): details.timeline = [PersistedIteration{...tools[]}]
+		// We adapt both by mapping `actions` OR `tools` into per-action top-level
+		// cards interleaved with the displayText block.
 		const rebuildFlow = (
 			toolCallId: string,
 			persisted: any[],
@@ -415,87 +411,112 @@ export class HttpServer {
 			const out: FlowBlock[] = [];
 			let anyDisplayText = false;
 
-			persisted.forEach((iter, i) => {
-				if (!iter || typeof iter !== "object") return;
-				const iterId = `${toolCallId}-iter-${i}`;
-				const iterStep: TimelineStep = {
-					id: iterId,
+			persisted.forEach((entry, i) => {
+				if (!entry || typeof entry !== "object") return;
+				const callId = `${toolCallId}-call-${i}`;
+
+				// Parent card label: prefer skill-aware label from new schema.
+				const parentLabel = typeof entry.label === "string"
+					? entry.label
+					: typeof entry.skill === "string"
+						? `Ask DIA (${entry.skill})`
+						: `DIA iteration ${i + 1}`;
+
+				const parentStep: TimelineStep = {
+					id: callId,
 					kind: "iter",
-					label: typeof iter.label === "string" ? iter.label : `DIA iteration ${i + 1}`,
-					status: iter.status === "error" ? "error" : "ok",
-					durationMs: typeof iter.durationMs === "number" ? iter.durationMs : undefined,
-					summary: typeof iter.summary === "string" ? iter.summary : undefined,
-					subSteps: Array.isArray(iter.pipeline) ? iter.pipeline : undefined,
-					ragSources: Array.isArray(iter.ragSources) ? iter.ragSources : undefined,
-					llmMeta: iter.llmMeta && typeof iter.llmMeta === "object" ? iter.llmMeta : undefined,
+					label: parentLabel,
+					status: entry.status === "error" ? "error" : "ok",
+					durationMs: typeof entry.durationMs === "number" ? entry.durationMs : undefined,
+					summary: typeof entry.summary === "string" ? entry.summary : undefined,
+					subSteps: Array.isArray(entry.pipeline) ? entry.pipeline : undefined,
+					ragSources: Array.isArray(entry.ragSources) ? entry.ragSources : undefined,
+					llmMeta: entry.llmMeta && typeof entry.llmMeta === "object" ? entry.llmMeta : undefined,
 				};
 
 				const phaseSteps: TimelineStep[] = [];
-				for (const phase of Array.isArray(iter.phases) ? iter.phases : []) {
+				for (const phase of Array.isArray(entry.phases) ? entry.phases : []) {
 					if (!phase || typeof phase !== "object") continue;
 					const phaseKind = phase.phase as TimelineStep["kind"];
 					if (phaseKind !== "oauth" && phaseKind !== "history" && phaseKind !== "fetch_dia") continue;
 					phaseSteps.push({
-						id: `${iterId}-phase-${phase.phase}`,
+						id: `${callId}-phase-${phase.phase}`,
 						kind: phaseKind,
 						label: typeof phase.label === "string" ? phase.label : phase.phase,
-						parentId: iterId,
+						parentId: callId,
 						status: phase.status === "error" ? "error" : "ok",
 						durationMs: typeof phase.durationMs === "number" ? phase.durationMs : undefined,
 						summary: typeof phase.summary === "string" ? phase.summary : undefined,
 					});
 				}
 
-				const toolList = Array.isArray(iter.tools) ? iter.tools : [];
-				const displayText = typeof iter.displayText === "string" ? iter.displayText.trim() : "";
+				// New schema uses `actions`; legacy schema uses `tools`. Either way,
+				// each item becomes a top-level card after the displayText.
+				const actionList: any[] = Array.isArray(entry.actions)
+					? entry.actions
+					: Array.isArray(entry.tools)
+						? entry.tools
+						: [];
+				const displayText = typeof entry.displayText === "string" ? entry.displayText.trim() : "";
 
 				if (displayText) {
 					anyDisplayText = true;
-					// NEW interleaved layout: iter card → display text → per-tool cards.
-					out.push({ type: "steps", steps: [iterStep, ...phaseSteps] });
+					out.push({ type: "steps", steps: [parentStep, ...phaseSteps] });
 					out.push({ type: "text", text: displayText });
-					toolList.forEach((tool: any, j: number) => {
-						if (!tool || typeof tool !== "object") return;
-						const toolStep: TimelineStep = {
-							id: `${iterId}-tool-${j}`,
-							kind: "tool",
-							label:
-								typeof tool.label === "string"
-									? tool.label
-									: typeof tool.tool === "string"
-										? tool.tool
-										: "tool",
-							// NO parentId -- top-level card sitting AFTER the text.
-							status: tool.status === "error" ? "error" : "ok",
-							durationMs: typeof tool.durationMs === "number" ? tool.durationMs : undefined,
-							summary: typeof tool.summary === "string" ? tool.summary : undefined,
-						};
-						out.push({ type: "steps", steps: [toolStep] });
+					actionList.forEach((act: any, j: number) => {
+						if (!act || typeof act !== "object") return;
+						// Skip the display action — it's already represented by the
+						// text block above. Only write_file / write_artifact / etc.
+						// render as standalone cards.
+						if (act.kind === "display") return;
+						const label =
+							typeof act.label === "string"
+								? act.label
+								: typeof act.tool === "string"
+									? act.tool
+									: typeof act.kind === "string"
+										? act.kind
+										: "action";
+						out.push({
+							type: "steps",
+							steps: [
+								{
+									id: `${callId}-act-${j}`,
+									kind: "tool",
+									label,
+									status: act.status === "error" ? "error" : "ok",
+									durationMs: typeof act.durationMs === "number" ? act.durationMs : undefined,
+									summary: typeof act.summary === "string" ? act.summary : undefined,
+								},
+							],
+						});
 					});
 				} else {
-					// LEGACY nested layout for sessions written before displayText capture.
-					const nestedTools: TimelineStep[] = toolList
-						.filter((t: any) => t && typeof t === "object")
-						.map((tool: any, j: number) => ({
-							id: `${iterId}-tool-${j}`,
+					// No displayText (non-JSON DIA reply or legacy session) — render
+					// everything as one nested card.
+					const nestedActions: TimelineStep[] = actionList
+						.filter((a: any) => a && typeof a === "object")
+						.map((act: any, j: number) => ({
+							id: `${callId}-act-${j}`,
 							kind: "tool",
 							label:
-								typeof tool.label === "string"
-									? tool.label
-									: typeof tool.tool === "string"
-										? tool.tool
-										: "tool",
-							parentId: iterId,
-							status: tool.status === "error" ? "error" : "ok",
-							durationMs: typeof tool.durationMs === "number" ? tool.durationMs : undefined,
-							summary: typeof tool.summary === "string" ? tool.summary : undefined,
+								typeof act.label === "string"
+									? act.label
+									: typeof act.tool === "string"
+										? act.tool
+										: typeof act.kind === "string"
+											? act.kind
+											: "action",
+							parentId: callId,
+							status: act.status === "error" ? "error" : "ok",
+							durationMs: typeof act.durationMs === "number" ? act.durationMs : undefined,
+							summary: typeof act.summary === "string" ? act.summary : undefined,
 						}));
-					out.push({ type: "steps", steps: [iterStep, ...phaseSteps, ...nestedTools] });
+					out.push({ type: "steps", steps: [parentStep, ...phaseSteps, ...nestedActions] });
 				}
 			});
 
-			// Legacy fallback: trailing text block from finalDiaDisplay when no iter
-			// supplied displayText (pre-Phase 8.5 sessions or non-JSON DIA replies).
+			// Legacy fallback: surface finalDiaDisplay if no entry carried displayText.
 			if (!anyDisplayText && finalDiaDisplay && finalDiaDisplay.trim()) {
 				out.push({ type: "text", text: finalDiaDisplay.trim() });
 			}
@@ -611,11 +632,12 @@ export class HttpServer {
 							files.push({ path: normalizedPath, title: tc.args.title as string | undefined });
 						}
 
-						// callDIABrain runs `attach` nested in its sub-loop, so the file paths
-						// only live in the toolResult's `details.attachedFiles`. Lift them up
-						// here so chips re-appear on page refresh. Likewise, fall back to the
-						// DIA `display` text when the assistant message body is empty (which
-						// happens whenever short-circuit aborts nano before it emits text).
+						// callDIABrain auto-writes + attaches files inside its dispatcher
+						// (canonical fields write_file / write_artifact). The file paths
+						// only live in the toolResult's `details.attachedFiles`. Lift them
+						// up here so chips re-appear on page refresh. Likewise, prefer
+						// the DIA `display` field when the assistant message body is empty
+						// (the guardrail dropped any nano text).
 						if (tc.name === "callDIABrain" && result?.details) {
 							const details = result.details;
 							const nested = Array.isArray(details.attachedFiles) ? details.attachedFiles : [];
@@ -625,13 +647,19 @@ export class HttpServer {
 									files.push({ path: normalizedPath, title: typeof f.title === "string" ? f.title : undefined });
 								}
 							}
-							if (!mainText && typeof details.finalDiaDisplay === "string" && details.finalDiaDisplay.trim()) {
-								mainText = details.finalDiaDisplay.trim();
+							// New schema: details.display (renamed from finalDiaDisplay).
+							// Fall back to legacy field for old sessions.
+							const diaDisplay =
+								typeof details.display === "string" && details.display.trim()
+									? details.display.trim()
+									: typeof details.finalDiaDisplay === "string" && details.finalDiaDisplay.trim()
+										? details.finalDiaDisplay.trim()
+										: undefined;
+							if (!mainText && diaDisplay) {
+								mainText = diaDisplay;
 							}
 							if (Array.isArray(details.timeline) && details.timeline.length > 0) {
-								const finalDisplay =
-									typeof details.finalDiaDisplay === "string" ? details.finalDiaDisplay : undefined;
-								flowBlocks.push(...rebuildFlow(tc.id, details.timeline, finalDisplay));
+								flowBlocks.push(...rebuildFlow(tc.id, details.timeline, diaDisplay));
 							}
 						}
 					}

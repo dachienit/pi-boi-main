@@ -2,16 +2,77 @@
 
 import "dotenv/config";
 
-// Setup global proxy for LLM calls (must be before any fetch)
+// Setup global proxy for LLM calls (must be before any fetch).
+//
+// IMPORTANT: pi-ai's `utils/http-proxy.js` runs an async `import("undici").then`
+// that calls `setGlobalDispatcher(new EnvHttpProxyAgent())` AFTER our manual
+// ProxyAgent install — silently overriding it with a dispatcher that reads
+// `HTTPS_PROXY` / `HTTP_PROXY` env vars. To survive that override we also
+// expose the proxy URL (with embedded basic auth) via the standard env vars
+// before any pi-ai code runs.
 import { setGlobalDispatcher, ProxyAgent } from "undici";
 if (process.env.PROX) {
-	const proxyUri = new URL(process.env.PROX).toString();
+	// Build the proxy URL manually because `new URL(...).toString()` collapses
+	// `iyh1hc:@host` (empty password) to `iyh1hc@host` (no separator), which
+	// EnvHttpProxyAgent cannot parse. We always emit `user:password@host` with
+	// the colon present, even when password is empty.
+	const baseUrl = new URL(process.env.PROX);
+	let proxyUri: string;
+	if (process.env.AGENT_USER) {
+		const userEnc = encodeURIComponent(process.env.AGENT_USER);
+		const pwdEnc = encodeURIComponent(process.env.AGENT_PWD || "");
+		proxyUri = `${baseUrl.protocol}//${userEnc}:${pwdEnc}@${baseUrl.host}`;
+	} else {
+		proxyUri = `${baseUrl.protocol}//${baseUrl.host}`;
+	}
+
+	// (1) Install our own ProxyAgent first — covers any sync fetch that fires
+	// before pi-ai's async http-proxy.js callback resolves.
 	const token = process.env.AGENT_USER
 		? `Basic ${Buffer.from(`${process.env.AGENT_USER}:${process.env.AGENT_PWD || ""}`).toString("base64")}`
 		: undefined;
 	const dispatcher = new ProxyAgent({ uri: proxyUri, token });
 	setGlobalDispatcher(dispatcher);
+
+	// (2) Mirror to standard env vars so EnvHttpProxyAgent (pi-ai override)
+	// resolves to the same proxy with embedded auth. Without this, pi-ai's
+	// override silently bypasses the proxy (or worse: picks up a stale Windows
+	// env var pointing at the corporate proxy WITHOUT auth, causing every LLM
+	// Farm call to fail with a generic "Connection error"). We FORCE-overwrite
+	// any pre-existing HTTPS_PROXY so the local authenticated forwarder wins.
+	process.env.HTTPS_PROXY = proxyUri;
+	process.env.HTTP_PROXY = proxyUri;
+	process.env.https_proxy = proxyUri;
+	process.env.http_proxy = proxyUri;
+
 	console.log(`✓ Proxy: ${process.env.PROX} (user: ${process.env.AGENT_USER || "none"})`);
+	console.log(`✓ HTTPS_PROXY = ${process.env.HTTPS_PROXY}`);
+}
+
+// Debug fetch wrapper — logs every outbound LLM Farm request to surface
+// silent connection failures from the OpenAI SDK retry loop.
+if (process.env.LLM_DEBUG === "true" && process.env.LLM_BASE_URL) {
+	const baseLLM = process.env.LLM_BASE_URL;
+	const _fetch = globalThis.fetch;
+	globalThis.fetch = (async (input: any, init?: any) => {
+		const url = typeof input === "string" ? input : input?.url ?? String(input);
+		const isLLM = url.startsWith(baseLLM);
+		if (isLLM) {
+			console.log(`[LLM_DEBUG] → ${init?.method || "GET"} ${url}`);
+		}
+		try {
+			const res = await _fetch(input, init);
+			if (isLLM) console.log(`[LLM_DEBUG] ← ${res.status} ${url}`);
+			return res;
+		} catch (err) {
+			if (isLLM) {
+				const cause = (err as any)?.cause;
+				console.log(`[LLM_DEBUG] ✗ ${url} -- ${err}`);
+				if (cause) console.log(`[LLM_DEBUG]   cause: ${cause}`);
+			}
+			throw err;
+		}
+	}) as typeof fetch;
 }
 
 // Add api-version query param for Azure OpenAI endpoints (required by Bosch GenAI Platform)
